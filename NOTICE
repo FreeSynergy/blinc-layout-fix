@@ -1,0 +1,4 @@
+This is blinc_layout 0.6.0 from https://github.com/project-blinc/Blinc (Apache-2.0, see LICENSE) with one change:
+after an incremental update only the nodes whose props the update replaced take the stylesheet again
+(RenderTree::restyle_replaced_nodes), the same change as in project-blinc/Blinc pull request 71.
+It is meant to be replaced by upstream once the change is released there.

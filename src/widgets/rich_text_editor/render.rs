@@ -1,0 +1,803 @@
+//! Read-only renderer for `RichDocument`.
+//!
+//! This phase produces a static element tree from a document — paragraphs,
+//! headings, list items, quotes, dividers — using the existing `RichText`
+//! element for inline span rendering. No cursor, no selection, no editing.
+//!
+//! Editing-aware rendering (cursor overlay, selection rects, click → cursor)
+//! is added in Phase 3.
+//!
+//! # Theme
+//!
+//! Sizes are passed in via [`RichTextTheme`]. Colours come from the
+//! `.blinc-rich-text` rules of the layout stylesheet unless the theme sets
+//! them; [`RichTextTheme::dark`] and [`RichTextTheme::light`] are fixed
+//! palettes.
+
+use super::document::{Block, BlockKind, RichDocument};
+use crate::div::{Div, FontWeight, div};
+use crate::rich_text::{RichText, rich_text_styled};
+use crate::styled_text::StyledText;
+use blinc_core::Color;
+
+/// Visual configuration for the rich text renderer.
+///
+/// Sizes are explicit. A colour left `None` comes from the stylesheet's
+/// `.blinc-rich-text` rules, so it follows the theme; one set here wins.
+#[derive(Clone, Debug)]
+pub struct RichTextTheme {
+    /// Text without a colour of its own, over the `.blinc-rich-text`
+    /// rule's; also the caret and selection colour.
+    pub text: Option<Color>,
+    /// List markers, over the `.blinc-rich-text-marker` rule's.
+    pub muted: Option<Color>,
+    /// The blockquote's left border, over the `.blinc-rich-text-quote-bar`
+    /// rule's.
+    pub quote_border: Option<Color>,
+    /// The divider line, over the `.blinc-rich-text-divider` rule's.
+    pub divider: Option<Color>,
+    /// Base font size for paragraph text (px).
+    pub font_size: f32,
+    /// Heading sizes for levels 1..=6 in px.
+    pub heading_sizes: [f32; 6],
+    /// Vertical spacing between blocks (px).
+    pub block_gap: f32,
+    /// Horizontal indent step for nested list items (px).
+    pub indent_step: f32,
+    /// Width of the blockquote left border (px).
+    pub quote_border_width: f32,
+    /// Width of the marker column for bullet/numbered list items (px).
+    pub bullet_column_width: f32,
+    /// Line height multiplier (1.0 = font_size, 1.5 = font_size * 1.5).
+    /// Used both for spacing between visual lines and for cursor height.
+    pub line_height: f32,
+}
+
+impl RichTextTheme {
+    /// A fixed palette for a dark UI, whatever the theme.
+    pub fn dark() -> Self {
+        Self {
+            text: Some(Color::rgba(0.92, 0.92, 0.95, 1.0)),
+            muted: Some(Color::rgba(0.62, 0.62, 0.7, 1.0)),
+            quote_border: Some(Color::rgba(0.35, 0.35, 0.42, 1.0)),
+            divider: Some(Color::rgba(0.25, 0.25, 0.32, 1.0)),
+            ..Self::default()
+        }
+    }
+
+    /// A fixed palette for a light UI, whatever the theme.
+    pub fn light() -> Self {
+        Self {
+            text: Some(Color::rgba(0.10, 0.10, 0.13, 1.0)),
+            muted: Some(Color::rgba(0.42, 0.42, 0.5, 1.0)),
+            quote_border: Some(Color::rgba(0.78, 0.78, 0.84, 1.0)),
+            divider: Some(Color::rgba(0.88, 0.88, 0.92, 1.0)),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn heading_size(&self, level: u8) -> f32 {
+        let i = (level.clamp(1, 6) - 1) as usize;
+        self.heading_sizes[i]
+    }
+}
+
+/// Colours from the stylesheet, so the editor follows the theme.
+impl Default for RichTextTheme {
+    fn default() -> Self {
+        Self {
+            text: None,
+            muted: None,
+            quote_border: None,
+            divider: None,
+            font_size: 15.0,
+            heading_sizes: [30.0, 24.0, 20.0, 18.0, 16.0, 15.0],
+            block_gap: 8.0,
+            indent_step: 24.0,
+            quote_border_width: 3.0,
+            bullet_column_width: 18.0,
+            line_height: 1.45,
+        }
+    }
+}
+
+/// Build a flat element tree representing `doc` using `theme`.
+///
+/// `content_width` is the pixel width of the column the document will be
+/// rendered into. It's required because [`RichText`] needs an explicit
+/// `wrap_to_width` to compute multi-line layouts — without it, long lines
+/// silently overflow to the right of the container. Pass the inner width
+/// of whatever wrapping div hosts the editor (i.e. width minus padding).
+///
+/// All spacing in the returned tree is expressed in raw pixels via `_px`
+/// builders so that the renderer is independent of the global 4-unit
+/// spacing scale used by the rest of the layout API.
+pub fn render_document(doc: &RichDocument, theme: &RichTextTheme, content_width: f32) -> Div {
+    let mut root = div()
+        .class("blinc-rich-text")
+        .w_full()
+        .flex_col()
+        .gap_px(theme.block_gap);
+    for (i, block) in doc.blocks.iter().enumerate() {
+        root = root.child(render_block(doc, i, block, theme, content_width));
+    }
+    root
+}
+
+/// Build the element tree for a single block.
+///
+/// `index` is the block's position in `doc` — used for computing numbered
+/// list ordinals. `content_width` is the available pixel width *outside*
+/// any indent: each block subtracts its own indent before passing the
+/// remainder down to its inline content.
+pub(super) fn render_block(
+    doc: &RichDocument,
+    index: usize,
+    block: &Block,
+    theme: &RichTextTheme,
+    content_width: f32,
+) -> Div {
+    let indent_px = (block.indent as f32) * theme.indent_step;
+    let inner_width = (content_width - indent_px).max(0.0);
+
+    match &block.kind {
+        BlockKind::Paragraph => indented_block(
+            paragraph_div(
+                block,
+                theme,
+                theme.font_size,
+                FontWeight::Normal,
+                false,
+                inner_width,
+            ),
+            indent_px,
+        ),
+        BlockKind::Heading(level) => indented_block(
+            paragraph_div(
+                block,
+                theme,
+                theme.heading_size(*level),
+                FontWeight::Bold,
+                false,
+                inner_width,
+            ),
+            indent_px,
+        ),
+        BlockKind::BulletItem => {
+            list_item_div(block, theme, "•".to_string(), indent_px, inner_width)
+        }
+        BlockKind::NumberedItem => {
+            let ordinal = doc.numbered_ordinal(index).unwrap_or(1);
+            list_item_div(
+                block,
+                theme,
+                format!("{}.", ordinal),
+                indent_px,
+                inner_width,
+            )
+        }
+        BlockKind::Quote => quote_div(block, theme, indent_px, inner_width),
+        BlockKind::Divider => {
+            let line = div().class("blinc-rich-text-divider").w_full().h(1.0);
+            let line = match theme.divider {
+                Some(c) => line.bg(c),
+                None => line,
+            };
+            indented_block(line, indent_px)
+        }
+    }
+}
+
+/// Wrap `inner` in a parent div whose left padding equals `indent_px`. Done
+/// via a wrapper because there's no per-side `_px` padding builder; using
+/// `pl(units)` would re-introduce the 4× scale bug.
+fn indented_block(inner: Div, indent_px: f32) -> Div {
+    if indent_px <= 0.5 {
+        return inner.w_full();
+    }
+    div()
+        .w_full()
+        .flex_row()
+        .child(div().w(indent_px))
+        .child(inner.w_full())
+}
+
+/// Build a paragraph-style div containing one row per visual line.
+///
+/// Each source `StyledLine` is pre-wrapped to `line_width` via
+/// [`super::wrap::wrap_styled_line_with_offsets`] and the resulting
+/// chunks become rows. Each row is a fixed-height `relative()`
+/// container that hosts its runs as **absolutely-positioned children**
+/// at the exact pixel `x_in_line` computed by
+/// [`build_runs_for_visual_line`]. This bypasses flex layout entirely
+/// for the runs themselves so the rendered glyphs align with the
+/// geometry the cursor uses for hit-testing.
+///
+/// NOTE: there's a known interaction with `wrap_styled_line` where the
+/// chip on a wrapped paragraph appears visually adjacent to neighbour
+/// text without a space. The bug is in the pre-wrap step (or in how
+/// `RichText` measures the wrapped chunk's text), not in the run
+/// positioning itself — putting the chip line on its own paragraph
+/// renders correctly. Tracking under "DEFERRED: monospace inline-code
+/// chip rendering".
+fn paragraph_div(
+    block: &Block,
+    theme: &RichTextTheme,
+    font_size: f32,
+    weight: FontWeight,
+    italic: bool,
+    line_width: f32,
+) -> Div {
+    let line_height_px = font_size * theme.line_height;
+    let mut col = div().w_full().flex_col();
+    for source_line in &block.lines {
+        let visual_lines = if line_width > 0.0 {
+            super::wrap::wrap_styled_line_with_offsets(
+                source_line,
+                line_width,
+                font_size,
+                weight,
+                italic,
+            )
+        } else {
+            vec![super::wrap::WrappedLine {
+                line: source_line.clone(),
+                source_start_col: 0,
+                source_end_col: source_line.text.chars().count(),
+            }]
+        };
+        for visual in &visual_lines {
+            col = col.child(absolute_positioned_line(
+                visual,
+                theme,
+                font_size,
+                weight,
+                italic,
+                line_width,
+                line_height_px,
+            ));
+        }
+    }
+    col
+}
+
+/// Build a single visual line as an absolute-positioned container.
+/// Each run's `RichText` sits at the geometry's exact `x_in_line`, so
+/// flex layout never gets a chance to shrink the body run away from
+/// its measured width.
+fn absolute_positioned_line(
+    visual: &super::wrap::WrappedLine,
+    theme: &RichTextTheme,
+    font_size: f32,
+    weight: FontWeight,
+    italic: bool,
+    line_width: f32,
+    line_height_px: f32,
+) -> Div {
+    let visual_line = &visual.line;
+    let len = visual_line.text.len();
+
+    // Per-byte boolean: which bytes are code-flagged?
+    let mut code_at: Vec<bool> = vec![false; len];
+    for span in &visual_line.spans {
+        if !span.code {
+            continue;
+        }
+        let s = span.start.min(len);
+        let e = span.end.min(len);
+        for b in code_at.iter_mut().take(e).skip(s) {
+            *b = true;
+        }
+    }
+
+    // Walk byte-by-byte and emit (byte_start, byte_end, is_code) ranges
+    // at every transition. Mirrors `build_runs_for_visual_line` so the
+    // renderer's runs align 1:1 with the geometry's runs.
+    let mut byte_ranges: Vec<(usize, usize, bool)> = Vec::new();
+    if len > 0 {
+        let mut seg_start = 0usize;
+        let mut current_is_code = code_at[0];
+        let mut byte = 0usize;
+        while byte < len {
+            let here = code_at[byte];
+            if here != current_is_code {
+                byte_ranges.push((seg_start, byte, current_is_code));
+                seg_start = byte;
+                current_is_code = here;
+            }
+            let ch_len = visual_line.text[byte..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+            byte += ch_len;
+        }
+        byte_ranges.push((seg_start, len, current_is_code));
+    }
+
+    // Hot path: single non-code run — emit a single RichText without
+    // any absolute positioning. The line container still gets an
+    // explicit width.
+    if byte_ranges.len() == 1 && !byte_ranges[0].2 {
+        // The child needs the width as well as the container: a
+        // content-sized child is handed min-content and wraps inside a
+        // box that is already the right size, so a heading broke across
+        // two lines inside a one-line box and overlapped what followed.
+        return div()
+            .w(line_width)
+            .h(line_height_px)
+            .child(make_rich_text(visual_line, theme, font_size, weight, italic).w(line_width));
+    }
+
+    // Multiple runs OR a code-only run — use a relative container with
+    // absolute children at the precomputed x positions.
+    let body_font = crate::div::FontFamily::default();
+    let code_font = crate::div::FontFamily::monospace();
+
+    // Put every run on one baseline. Each is otherwise centred in its own
+    // box by half-leading, so the monospace of an inline code run draws
+    // above the prose beside it. `make_code_run` pins the weight to
+    // Normal, so its baseline is computed that way.
+    let body_baseline = run_baseline(font_size, theme.line_height, weight, italic, &body_font);
+    let code_baseline = run_baseline(
+        font_size,
+        theme.line_height,
+        FontWeight::Normal,
+        false,
+        &code_font,
+    );
+    let line_baseline = body_baseline.max(code_baseline);
+
+    let mut x_cursor = 0.0_f32;
+    let mut container = div().w(line_width).h(line_height_px).relative();
+    for (bstart, bend, is_code) in byte_ranges {
+        if bstart >= bend {
+            continue;
+        }
+        let font_family = if is_code { &code_font } else { &body_font };
+        // Advance by the run's FULL width, spaces included, so the next
+        // run starts where this one really ends.
+        let full = slice_styled_line(visual_line, bstart, bend);
+        let width =
+            super::state::measure_width(&full.text, font_size, weight, italic, Some(font_family));
+
+        // Draw the run without its edge spaces, and shift it right by
+        // the leading space's width. Text rendering drops a leading or
+        // trailing space, so a run whose box merely reserved room for
+        // one came out butted against its neighbour: "a`code`via". The
+        // space is now spent on position rather than left to the
+        // renderer to honour.
+        let lead = bstart + (full.text.len() - full.text.trim_start().len());
+        let trail = bend - (full.text.len() - full.text.trim_end().len());
+        let (draw_start, draw_end) = if lead < trail {
+            (lead, trail)
+        } else {
+            // All whitespace: nothing to draw, but still advance.
+            (bstart, bstart)
+        };
+        if draw_start >= draw_end {
+            x_cursor += width;
+            continue;
+        }
+        let run_line = slice_styled_line(visual_line, draw_start, draw_end);
+        let lead_w = if draw_start > bstart {
+            super::state::measure_width(
+                &visual_line.text[bstart..draw_start],
+                font_size,
+                weight,
+                italic,
+                Some(font_family),
+            )
+        } else {
+            0.0
+        };
+        let draw_w = super::state::measure_width(
+            &run_line.text,
+            font_size,
+            weight,
+            italic,
+            Some(font_family),
+        );
+        // Drop the run so its own baseline meets the line's.
+        let own_baseline = if is_code {
+            code_baseline
+        } else {
+            body_baseline
+        };
+        let mut positioned = div();
+        if is_code {
+            positioned = positioned.class("blinc-rich-text-code");
+        }
+        let positioned = positioned
+            .absolute()
+            .left(x_cursor + lead_w)
+            // Rounded: an absolute top lands on a whole pixel anyway,
+            // and letting it round implicitly left the run a pixel off.
+            .top((line_baseline - own_baseline).round())
+            .w(draw_w.ceil())
+            .h(line_height_px)
+            .child(if is_code {
+                make_code_run(&run_line, theme, font_size, weight, italic).w(draw_w.ceil())
+            } else {
+                make_rich_text(&run_line, theme, font_size, weight, italic).w(draw_w.ceil())
+            });
+        container = container.child(positioned);
+        x_cursor += width;
+    }
+    container
+}
+
+/// Build a `StyledLine` containing just the text and rebased spans for
+/// byte range `[start, end)` of `source`.
+fn slice_styled_line(
+    source: &crate::styled_text::StyledLine,
+    start: usize,
+    end: usize,
+) -> crate::styled_text::StyledLine {
+    use crate::styled_text::{StyledLine, TextSpan};
+    let text = source.text[start..end].to_string();
+    let mut spans = Vec::new();
+    for span in &source.spans {
+        let s = span.start.max(start);
+        let e = span.end.min(end);
+        if s >= e {
+            continue;
+        }
+        spans.push(TextSpan {
+            start: s - start,
+            end: e - start,
+            color: span.color,
+            bold: span.bold,
+            italic: span.italic,
+            underline: span.underline,
+            strikethrough: span.strikethrough,
+            code: span.code,
+            link_url: span.link_url.clone(),
+            token_type: span.token_type.clone(),
+        });
+    }
+    StyledLine { text, spans }
+}
+
+/// Build a list-item row: marker on the left, content on the right.
+fn list_item_div(
+    block: &Block,
+    theme: &RichTextTheme,
+    marker: String,
+    indent_px: f32,
+    inner_width: f32,
+) -> Div {
+    // Transparent: the marker takes the `.blinc-rich-text-marker` colour.
+    let ink = theme.muted.unwrap_or(Color::TRANSPARENT);
+    let marker_text = rich_text_styled(StyledText::plain(&marker, ink)).size(theme.font_size);
+    // The marker column eats `bullet_column_width + 8` (gap) of the inner width.
+    let line_width = (inner_width - theme.bullet_column_width - 8.0).max(0.0);
+
+    let row = div()
+        .w_full()
+        .flex_row()
+        .gap_px(8.0)
+        .child(
+            div()
+                .class("blinc-rich-text-marker")
+                .w(theme.bullet_column_width)
+                .child(marker_text),
+        )
+        .child(paragraph_div(
+            block,
+            theme,
+            theme.font_size,
+            FontWeight::Normal,
+            false,
+            line_width,
+        ));
+    indented_block(row, indent_px)
+}
+
+/// Build a blockquote div with a left border and muted italic text.
+fn quote_div(block: &Block, theme: &RichTextTheme, indent_px: f32, inner_width: f32) -> Div {
+    // Border + gap consume `quote_border_width + 12` of the inner width.
+    let line_width = (inner_width - theme.quote_border_width - 12.0).max(0.0);
+    let inner = paragraph_div(
+        block,
+        theme,
+        theme.font_size,
+        FontWeight::Normal,
+        true,
+        line_width,
+    );
+    let row = div()
+        .w_full()
+        .flex_row()
+        .gap_px(12.0)
+        .child({
+            let bar = div()
+                .class("blinc-rich-text-quote-bar")
+                .w(theme.quote_border_width);
+            match theme.quote_border {
+                Some(c) => bar.bg(c),
+                None => bar,
+            }
+        })
+        .child(inner);
+    indented_block(row, indent_px)
+}
+
+/// Render a single (already pre-wrapped) styled line as a `flex_row`
+/// of `RichText` siblings, one per run.
+///
+/// A "run" is a contiguous slice of the line where every character
+/// shares the same font (family + weight + italic + size). Currently
+/// we only split on inline code (body text vs monospace), but the
+/// machinery generalizes to any per-span font override.
+///
+/// The cursor / hit-test path in [`super::state`] uses the matching
+/// `RunGeometry` produced by [`build_runs_for_visual_line`] for pixel
+/// measurement, so the runs rendered here and the runs measured there
+/// stay in lockstep — every run's pixel left edge in the rendered
+/// flex row equals its `RunGeometry.x_in_line`, and every run's pixel
+/// width matches the geometry's `width`. That's why the cursor lands
+/// on the right character even when a line mixes proportional and
+/// monospace text.
+fn render_line_row(
+    line: &crate::styled_text::StyledLine,
+    theme: &RichTextTheme,
+    font_size: f32,
+    weight: FontWeight,
+    italic: bool,
+) -> Div {
+    let segments = split_line_by_code(line);
+    if segments.len() == 1 && !segments[0].is_code {
+        // Hot path: no inline code at all — emit a single RichText so
+        // the row layout cost matches the pre-Phase-5 baseline.
+        return div().w_full().child(make_rich_text(
+            &segments[0].line,
+            theme,
+            font_size,
+            weight,
+            italic,
+        ));
+    }
+
+    let mut row = div().w_full().flex_row().items_start();
+    for seg in segments {
+        if seg.is_code {
+            row = row.child(make_code_run(&seg.line, theme, font_size, weight, italic));
+        } else {
+            row = row.child(make_rich_text(&seg.line, theme, font_size, weight, italic));
+        }
+    }
+    row
+}
+
+/// Distance from a run box's top down to the baseline the text is drawn
+/// on, for one face at one size.
+///
+/// Text is centred in its line box by half-leading, so a face's baseline
+/// sits at half_leading + ascender. Two faces with the same line box but
+/// different ascent/descent splits therefore draw on DIFFERENT
+/// baselines: at 15px and line-height 1.5, the UI face lands at 16.92
+/// and monospace at 15.24. Runs sharing a line have to be offset onto a
+/// common baseline, which is what `paragraph_div` uses this for.
+fn run_baseline(
+    font_size: f32,
+    line_height: f32,
+    weight: FontWeight,
+    italic: bool,
+    family: &crate::div::FontFamily,
+) -> f32 {
+    let mut options = crate::text_measure::TextLayoutOptions::new();
+    options.font_weight = weight.weight();
+    options.italic = italic;
+    options.line_height = line_height;
+    options.font_name = family.name.clone();
+    options.generic_font = family.generic;
+    // The string only selects the face; the metrics are the face's.
+    let m = crate::text_measure::measure_text_with_options("Hxq", font_size, &options);
+    let line_box = m.height / m.line_count.max(1) as f32;
+    let half_leading = (line_box - (m.ascender - m.descender)) / 2.0;
+    half_leading + m.ascender
+}
+
+/// Build a monospace `RichText` for a code run. No chip background or
+/// internal padding — purely a font + color change — so the rendered
+/// pixel width matches the geometry's `RunGeometry.width` exactly. Its
+/// colour is the `.blinc-rich-text-code` rule's, from the run's wrapper.
+fn make_code_run(
+    line: &crate::styled_text::StyledLine,
+    theme: &RichTextTheme,
+    font_size: f32,
+    _weight: FontWeight,
+    _italic: bool,
+) -> RichText {
+    let mut chip_line = line.clone();
+    for span in chip_line.spans.iter_mut() {
+        // Drop the `code` flag so the inner `RichText` doesn't recurse,
+        // and clear the colour so the code rule's applies.
+        span.code = false;
+        span.color = Color::TRANSPARENT;
+    }
+    let styled = StyledText::from_lines(vec![chip_line]);
+    rich_text_styled(styled)
+        .size(font_size)
+        .weight(FontWeight::Normal)
+        .line_height(theme.line_height)
+        .monospace()
+}
+
+/// One slice of a line, either a normal styled run or a code run.
+struct LineSegment {
+    line: crate::styled_text::StyledLine,
+    is_code: bool,
+}
+
+/// Walk a `StyledLine`'s spans and split its text at every transition
+/// between "any code" and "no code" coverage. Each segment's spans are
+/// rebased so `start` is `0`-relative.
+fn split_line_by_code(line: &crate::styled_text::StyledLine) -> Vec<LineSegment> {
+    use crate::styled_text::{StyledLine, TextSpan};
+
+    let len = line.text.len();
+    if len == 0 {
+        return vec![LineSegment {
+            line: line.clone(),
+            is_code: false,
+        }];
+    }
+
+    // Build a per-byte boolean: is this byte covered by a `code` span?
+    let mut code_at: Vec<bool> = vec![false; len];
+    for span in &line.spans {
+        if !span.code {
+            continue;
+        }
+        let s = span.start.min(len);
+        let e = span.end.min(len);
+        for b in code_at.iter_mut().take(e).skip(s) {
+            *b = true;
+        }
+    }
+
+    // Walk byte-by-byte and emit segments at every transition. Use
+    // char boundaries — a transition mid-codepoint is impossible
+    // because spans are stored on byte boundaries that match char
+    // boundaries (the editor only inserts at char boundaries).
+    let mut segments = Vec::new();
+    let mut seg_start = 0usize;
+    let mut current_is_code = code_at[0];
+    let mut byte = 0usize;
+    while byte < len {
+        let here = code_at[byte];
+        if here != current_is_code {
+            segments.push(slice_segment(line, seg_start, byte, current_is_code));
+            seg_start = byte;
+            current_is_code = here;
+        }
+        // Advance by one char to stay on UTF-8 boundaries.
+        let ch_len = line.text[byte..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        byte += ch_len;
+    }
+    segments.push(slice_segment(line, seg_start, len, current_is_code));
+    segments.retain(|s| !s.line.text.is_empty());
+    if segments.is_empty() {
+        return vec![LineSegment {
+            line: line.clone(),
+            is_code: false,
+        }];
+    }
+    segments
+}
+
+/// Build a `LineSegment` covering byte range `[start, end)` of `source`
+/// with the given code flag.
+fn slice_segment(
+    source: &crate::styled_text::StyledLine,
+    start: usize,
+    end: usize,
+    is_code: bool,
+) -> LineSegment {
+    use crate::styled_text::{StyledLine, TextSpan};
+
+    let text = source.text[start..end].to_string();
+    let mut spans = Vec::new();
+    for span in &source.spans {
+        let s = span.start.max(start);
+        let e = span.end.min(end);
+        if s >= e {
+            continue;
+        }
+        spans.push(TextSpan {
+            start: s - start,
+            end: e - start,
+            color: span.color,
+            bold: span.bold,
+            italic: span.italic,
+            underline: span.underline,
+            strikethrough: span.strikethrough,
+            code: span.code,
+            link_url: span.link_url.clone(),
+            token_type: span.token_type.clone(),
+        });
+    }
+    LineSegment {
+        line: StyledLine { text, spans },
+        is_code,
+    }
+}
+
+/// Build a `RichText` for a wrapped line. Each line goes into its own
+/// `RichText`, so wrapping inside a single line never happens at the
+/// shaper level — we already pre-wrap in `paragraph_div`.
+///
+/// Spans without a colour of their own take the inherited
+/// `.blinc-rich-text` colour, or the theme's text colour when it sets one:
+/// a span's colour is the only one that wins over an inherited rule.
+fn make_rich_text(
+    line: &crate::styled_text::StyledLine,
+    theme: &RichTextTheme,
+    font_size: f32,
+    weight: FontWeight,
+    italic: bool,
+) -> RichText {
+    let mut line = line.clone();
+    if let Some(c) = theme.text {
+        for span in line.spans.iter_mut().filter(|s| s.color.a <= 0.0) {
+            span.color = c;
+        }
+    }
+    let styled = StyledText::from_lines(vec![line]);
+    let mut rt = rich_text_styled(styled)
+        .size(font_size)
+        .weight(weight)
+        .line_height(theme.line_height);
+    if italic {
+        rt = rt.italic();
+    }
+    rt
+}
+
+pub use super::geometry::compute_line_geometry;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::styled_text::TextSpan;
+
+    fn sample_doc() -> RichDocument {
+        let mut p = Block::paragraph("Hello, world", Color::WHITE);
+        // Make "Hello" bold via a span override
+        p.lines[0].spans = vec![
+            TextSpan::new(0, 5, Color::WHITE, true),
+            TextSpan::colored(5, 12, Color::WHITE),
+        ];
+        RichDocument::from_blocks(vec![
+            Block::heading(1, "Demo", Color::WHITE),
+            p,
+            Block::bullet("first", Color::WHITE),
+            Block::bullet("second", Color::WHITE),
+            Block::numbered("alpha", Color::WHITE),
+            Block::numbered("beta", Color::WHITE),
+            Block::quote("a wise quote", Color::WHITE),
+            Block::divider(),
+            Block::paragraph("after the divider", Color::WHITE),
+        ])
+    }
+
+    #[test]
+    fn renders_without_panicking() {
+        let doc = sample_doc();
+        let theme = RichTextTheme::dark();
+        let _root = render_document(&doc, &theme, 720.0);
+    }
+
+    #[test]
+    fn empty_document_renders() {
+        let doc = RichDocument::new();
+        let theme = RichTextTheme::dark();
+        let _root = render_document(&doc, &theme, 720.0);
+    }
+}

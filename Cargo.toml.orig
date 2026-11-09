@@ -1,0 +1,128 @@
+[package]
+name = "blinc_layout"
+description = "Blinc layout engine - Flexbox layout powered by Taffy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/blinc_layout"
+rust-version.workspace = true
+
+[lib]
+crate-type = ["lib"]
+
+# The example calls `init_text_measurer`, which only exists with the
+# feature on, so `--all-targets` must not try to build it without.
+[[example]]
+name = "standalone_text_measure"
+required-features = ["text_measurer"]
+
+[features]
+default = []
+# Enable recorder integration for debugging/testing. Disable for production builds.
+recorder = []
+# Enable the audio / video / waveform widgets and pull in the
+# `blinc_media` crate's audio decoder stack (rodio + claxon + hound +
+# lewton + cpal + alsa/coreaudio). Off by default so apps that don't
+# play media don't pay the ~30-crate compile cost.
+media = ["dep:blinc_media"]
+# Enable image read/write through the system clipboard. When off,
+# `clipboard_read_image` / `clipboard_write_image` are stubs that
+# return None / false on every target — and arboard's `image-data`
+# feature stays disabled, dropping the entire `image` (PNG decoder)
+# chain plus ~30 transitive crates from the desktop dep graph. Apps
+# that only paste/copy text can stay off; image-paste flows opt in.
+clipboard_image = ["arboard/image-data"]
+# Font-backed text measurement. Off by default: it pulls in blinc_text
+# (ttf-parser + rustybuzz + fontdb + swash). Without it a standalone
+# `LayoutTree` measures text with `EstimatedTextMeasurer`, so every
+# width is an estimate. `blinc_app` turns it on for you.
+text_measurer = ["dep:blinc_text"]
+[dependencies]
+blinc_core = { path = "../blinc_core", version = "0.6.0" }
+blinc_css = { path = "../blinc_css", version = "0.6.0" }
+blinc_flow = { path = "../blinc_flow", version = "0.6.0" }
+blinc_macros = { path = "../blinc_macros", version = "0.6.0" }
+blinc_animation = { path = "../blinc_animation", version = "0.6.0" }
+blinc_theme = { path = "../blinc_theme", version = "0.6.0" }
+
+# Layout
+taffy.workspace = true
+
+# Data structures
+slotmap.workspace = true
+indexmap.workspace = true
+
+# Fast non-cryptographic hash used by `StableNodeId::derive_child` —
+# called for every node every build, so the FxHasher's speed matters.
+# Workspace pin (also used by blinc_router and ElementRegistry).
+rustc-hash.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Regex for syntax highlighting
+regex.workspace = true
+
+# Media widgets (audio/video player). Optional — gated by the `media`
+# feature so silent UIs don't drag in the audio decoder stack. Apps
+# that want media widgets enable `blinc_layout/media` (or just opt in
+# transitively through their own dep on `blinc_media`).
+blinc_media = { path = "../blinc_media", version = "0.6.0", optional = true }
+
+# Font-backed text measurement, behind the `text_measurer` feature.
+# blinc_text depends only on blinc_core, so this direction is
+# cycle-free; putting the measurer in blinc_text instead would have
+# made it depend on this crate and everything this crate pulls.
+blinc_text = { path = "../blinc_text", version = "0.6.0", optional = true }
+
+# Markdown parsing
+pulldown-cmark = "0.10"
+
+# HTML entity decoding
+html-escape = "0.2"
+
+# CSS parser combinators
+nom = "7"
+
+# `web_time::Instant` — drop-in replacement for `std::time::Instant`
+# that works on `wasm32-unknown-unknown` via `performance.now()`. On
+# native targets it's a `pub use std::time::Instant` re-export with
+# zero overhead. Required because `std::time::Instant::now()` panics
+# at runtime on wasm32 with "time not implemented on this platform".
+web-time = "1.1"
+
+# URL opening (for links) - desktop only
+[target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))'.dependencies]
+open = "5"
+
+# Clipboard (cross-platform text + image) — desktop + iOS only.
+# `arboard` does not compile on `wasm32-unknown-unknown` (no platform
+# backend) or on Android (no X11/Wayland/UIKit clipboard layer either).
+# The wasm runner provides its own impl in `widgets/text_edit.rs`
+# under `cfg(target_arch = "wasm32")` that goes through
+# `navigator.clipboard.writeText()` (see `web-sys` features below);
+# the Android runner stubs the clipboard via the system clipboard
+# service in `BlincNativeBridge.kt` and the matching Rust handler
+# that the native bridge dispatches into.
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))'.dependencies]
+# `default-features = false` drops `image-data` (image clipboard
+# bindings + PNG codec on Linux) and `wayland-data` (wayland-protocols
+# / smithay client). The text clipboard path — what every desktop
+# app uses for cut/copy/paste — needs neither, so the bare arboard
+# core is sufficient. The `clipboard_image` feature on this crate
+# flips `image-data` back on for apps that need image paste/copy.
+arboard = { version = "3", default-features = false }
+
+# Web clipboard plumbing for the wasm32 target. The text widgets
+# need to call `navigator.clipboard.writeText(...)` directly from
+# inside their Cmd+C / Cmd+X handlers, which requires
+# `web_sys::Window` + `Navigator::clipboard()` + `Clipboard::write_text()`.
+# `clipboard_read` on wasm intentionally does NOT use this — paste
+# is wired through a document-level `paste` event listener in the
+# web runner that broadcasts the pasted text into the focused
+# widget, bypassing the sync `clipboard_read` API entirely (the
+# browser clipboard read API is async-only and can't satisfy a
+# sync `Option<String>` return).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Window", "Navigator", "Clipboard"] }

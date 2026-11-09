@@ -1,0 +1,3001 @@
+//! Signal-bound property binding registry — Phase 2 of the unified
+//! property channel ([[project-reactive-architecture-v2]]).
+//!
+//! This is the substrate for `.bg(&state)`-style call sites: when a
+//! signal value changes, the registry walks subscribers and queues
+//! partial property updates via the same channel CSS animations,
+//! transitions, and stateful refreshes already use ([`PropertyId`] +
+//! [`SideEffects`] + the closure-form `queue_prop_update_partial`).
+//!
+//! # Architecture
+//!
+//! The registry lives in `blinc_layout` because it needs `LayoutNodeId`
+//! and the queue API; `blinc_core` exposes a [global notifier hook][1]
+//! that fires on every `State<T>::set`. The registry installs itself as
+//! that notifier on first access — no init order coupling for platform
+//! runners.
+//!
+//! [1]: blinc_core::reactive::set_property_binding_notifier
+//!
+//! # Lifecycle
+//!
+//! - **Register**: `Div::build` calls [`PropertyBindingRegistry::register`]
+//!   for every reactive modifier on the element. The registration carries
+//!   the target `LayoutNodeId`, the `PropertyId`, the `State<T>` (cloned)
+//!   for current-value reads, and a closure that knows how to write the
+//!   value into the right `RenderProps` field.
+//! - **Fire**: `State<T>::set` triggers the global notifier → registry
+//!   walks subscribers for that signal id → each subscriber reads the
+//!   latest value and pushes a [`PartialPropertyUpdate`][crate::stateful::PartialPropertyUpdate]
+//!   onto the unified queue. Platform runners drain the queue next frame.
+//! - **Cleanup**: `remove_subtree_nodes` calls
+//!   [`PropertyBindingRegistry::unregister_node`] for every removed
+//!   layout id. Bindings for nodes that no longer exist are evicted, so
+//!   stale subscribers can't fire on the next signal change.
+//!
+//! # API (this is the foundation — builder integration lands in P2.2)
+//!
+//! Phase 2.1 ships the registry + `IntoReactive` trait. Phase 2.2 wires
+//! the trait into `Div` builder methods so `.bg(&state)` actually
+//! registers. Phase 2.3+ rolls it across visual / layout properties.
+
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+
+use blinc_core::reactive::{Computed, DerivedId, Signal, SignalId, State};
+
+use crate::element::RenderProps;
+use crate::property::{PropertyId, SideEffects};
+use crate::stateful::{queue_prop_update_partial_beneath, queue_text_update};
+use crate::tree::LayoutNodeId;
+
+/// Reads the current value out of a signal's reactive graph and packages
+/// it in a [`BoundValue`]. Re-invoked on every fire (not cached).
+pub type ReadFn = Arc<dyn Fn() -> Option<BoundValue> + Send + Sync>;
+
+/// Writes a [`BoundValue`] into the right `RenderProps` field. Built
+/// once at `Bound` construction; reused on every fire.
+pub type WriteFn = Arc<dyn Fn(&mut RenderProps, &BoundValue) + Send + Sync>;
+
+/// Writes a [`BoundValue`] into the right taffy `Style` field. Mirror
+/// of [`WriteFn`] for layout-affecting bindings.
+pub type LayoutWriteFn = Arc<dyn Fn(&mut taffy::Style, &BoundValue) + Send + Sync>;
+
+/// Turns a [`BoundValue`] into the text a text node should show, or `None`
+/// when the value is not text.
+pub type TextWriteFn = Arc<dyn Fn(&BoundValue) -> Option<String> + Send + Sync>;
+
+/// A reactive value source — what an [`IntoReactive<T>`] impl resolves to.
+///
+/// Builder methods examine the variant: `Const` becomes an immediate
+/// `RenderProps` write at build time; `Bound` keeps a cheap `State<T>`
+/// clone that the builder uses to (a) read the initial value and (b)
+/// register a subscription against the minted `LayoutNodeId`.
+pub enum Reactive<T> {
+    /// Eager value — no subscription, written directly into the element
+    /// state at build time.
+    Const(T),
+    /// Signal-bound — register a subscription against the State's
+    /// signal id at build time. The builder method supplies the
+    /// `PropertyId` + writer; this just carries the data source.
+    Bound(State<T>),
+    /// Computed (derived) value — register a subscription against the
+    /// Computed's [`DerivedId`] at build time. Fires when ANY of the
+    /// derived's dependencies set, via the derived-binding notifier.
+    /// Bridge from [`blinc_core::reactive::Computed`] to the builder
+    /// surface. Multi-source reactivity (e.g. multi-axis transforms)
+    /// composes naturally here — the compute closure inside the
+    /// Computed combines as many source signals as needed.
+    Computed(Computed<T>),
+}
+
+impl<T: Clone> Clone for Reactive<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Const(v) => Self::Const(v.clone()),
+            Self::Bound(state) => Self::Bound(state.clone()),
+            Self::Computed(computed) => Self::Computed(computed.clone()),
+        }
+    }
+}
+
+impl<T: Clone + Send + 'static> Reactive<T> {
+    /// The value it holds now, for a handler that reads a bound prop when
+    /// its event arrives. `None` only when the source has no value yet.
+    pub fn now(&self) -> Option<T> {
+        match self {
+            Self::Const(v) => Some(v.clone()),
+            Self::Bound(state) => state.try_get(),
+            Self::Computed(computed) => computed.try_get(),
+        }
+    }
+
+    /// The value it holds, read inside a `computed` or effect closure through
+    /// the graph it is given, so the computation follows it.
+    pub fn read(&self, g: &blinc_core::reactive::ReactiveGraph) -> Option<T> {
+        match self {
+            Self::Const(v) => Some(v.clone()),
+            Self::Bound(state) => g.get(state.signal()),
+            Self::Computed(computed) => g.read_derived_in_flight(computed.derived()),
+        }
+    }
+}
+
+/// Type-erased value carrier for reactive bindings.
+///
+/// `Reactive::Bound` stores the read + write closures as type-erased
+/// (`Arc<dyn Fn>`); they shuttle values through this `Any`-backed
+/// wrapper rather than the concrete `T`. The downcast happens inside
+/// the `write` closure where the concrete type is known at the original
+/// `IntoReactive` construction site.
+pub struct BoundValue(pub Box<dyn std::any::Any + Send + Sync>);
+
+impl BoundValue {
+    pub fn new<T: Send + Sync + 'static>(v: T) -> Self {
+        Self(Box::new(v))
+    }
+
+    /// Downcast to a reference of the inner type. Returns `None` on
+    /// type mismatch (programmer error — would mean a binding's
+    /// write closure doesn't match its read closure's type).
+    pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+}
+
+/// Trait that lets `Div` builder methods accept both eager `T` values
+/// and signal-bound `&State<T>` references at the same call site.
+///
+/// Implemented in this crate for `T` (eager) and for `&State<T>`
+/// (signal-bound) — the two impls coexist via blanket-less specialisation
+/// (each impl targets a distinct type, no overlap).
+///
+/// # Example (post-P2.2 surface)
+///
+/// ```ignore
+/// // Eager — compiles to direct RenderProps write at build time
+/// div().bg(Color::RED)
+///
+/// // Signal-bound — registers a subscription; fires on state.set()
+/// let bg = State::new(...);
+/// div().bg(&bg)
+/// ```
+pub trait IntoReactive<T> {
+    fn into_reactive(self) -> Reactive<T>;
+}
+
+// Eager: any value of T is a Const reactive.
+impl<T> IntoReactive<T> for T {
+    fn into_reactive(self) -> Reactive<T> {
+        Reactive::Const(self)
+    }
+}
+
+/// Expose an f64 signal as a `Reactive<f32>` on the **signal** path.
+///
+/// Returns `Bound`, not `Computed`, and that distinction is the whole
+/// point. A `Bound` source registers against its `SignalId` and the
+/// binding fires on every set. A `Computed` source registers a derived
+/// binding, and derived bindings do not refresh the Div-backed
+/// properties -- the value would render once and then freeze while
+/// still compiling cleanly.
+///
+/// The returned `State<f32>` keeps the *source* signal's id, so
+/// subscription and `deps()` are unchanged, and narrows only on read.
+fn bind_f64_as_f32(sig: Signal<f64>) -> Reactive<f32> {
+    Reactive::Bound(State::mapped(
+        sig.id(),
+        Arc::new(move || sig.try_get().map(|v| v as f32)),
+        blinc_core::reactive::global_graph(),
+        blinc_core::reactive::global_dirty_flag(),
+    ))
+}
+
+/// Expose a `Computed<f64>` as a `Reactive<f32>` bound to the SAME
+/// derived.
+///
+/// Mirrors [`bind_f64_as_f32`] for the derived path. Wrapping the
+/// upstream in a second `Computed` would need derived-to-derived
+/// dependency tracking, which `get_derived` does not do -- the wrapper
+/// would never be marked dirty, so the prop would render once and
+/// freeze. Keeping the upstream's `DerivedId` means the binding fires
+/// exactly when the upstream does.
+fn bind_f64_computed_as_f32(c: Computed<f64>) -> Reactive<f32> {
+    let id = c.derived_id();
+    Reactive::Computed(Computed::mapped(
+        id,
+        Arc::new(move || c.try_get().map(|v| v as f32)),
+        blinc_core::reactive::global_graph(),
+    ))
+}
+
+// f64 -> f32 property sources.
+//
+// Layout stores f32 end to end (taffy's `Style`, `RenderProps`, the GPU
+// primitive buffers), but callers legitimately hold f64 -- the DSL
+// types every number as f64, its only float. These impls let an f64
+// value or signal reach an f32-backed property directly.
+//
+// Deliberately NOT done by making the setters generic over the numeric
+// type: with a generic `N`, `.opacity(&state)` becomes ambiguous,
+// because `&State<f32>` satisfies both `IntoReactive<f32>` and the
+// blanket `IntoReactive<&State<f32>>`. Keeping the setters at a
+// concrete `f32` pins `N` and leaves the documented call shapes
+// turbofish-free.
+impl IntoReactive<f32> for f64 {
+    fn into_reactive(self) -> Reactive<f32> {
+        Reactive::Const(self as f32)
+    }
+}
+
+impl IntoReactive<f32> for &State<f64> {
+    fn into_reactive(self) -> Reactive<f32> {
+        bind_f64_as_f32(Signal::from_id(self.signal_id()))
+    }
+}
+
+impl IntoReactive<f32> for State<f64> {
+    fn into_reactive(self) -> Reactive<f32> {
+        bind_f64_as_f32(Signal::from_id(self.signal_id()))
+    }
+}
+
+impl IntoReactive<f32> for Signal<f64> {
+    fn into_reactive(self) -> Reactive<f32> {
+        bind_f64_as_f32(self)
+    }
+}
+
+impl IntoReactive<f32> for &Signal<f64> {
+    fn into_reactive(self) -> Reactive<f32> {
+        bind_f64_as_f32(*self)
+    }
+}
+
+impl IntoReactive<f32> for Computed<f64> {
+    fn into_reactive(self) -> Reactive<f32> {
+        bind_f64_computed_as_f32(self)
+    }
+}
+
+impl IntoReactive<f32> for &Computed<f64> {
+    fn into_reactive(self) -> Reactive<f32> {
+        bind_f64_computed_as_f32(self.clone())
+    }
+}
+
+// Identity: an already-built `Reactive<T>` passes straight through.
+// Lets a caller that has resolved a reactive itself (a DSL bridge
+// narrowing f64 to f32, say) hand it to any `impl IntoReactive<T>`
+// parameter without unwrapping and losing the binding.
+impl<T> IntoReactive<T> for Reactive<T> {
+    fn into_reactive(self) -> Reactive<T> {
+        self
+    }
+}
+
+// `&str` -> `Reactive<String>`. The blanket impl above only gives
+// `IntoReactive<&str> for &str`, so without this a builder that takes
+// `impl IntoReactive<String>` would reject every string-literal call
+// site. Distinct trait instantiation, so no overlap with the blanket.
+impl IntoReactive<String> for &str {
+    fn into_reactive(self) -> Reactive<String> {
+        Reactive::Const(self.to_string())
+    }
+}
+
+// Same reasoning for `&String`, which `impl Into<String>` call sites
+// also passed freely before the reactive surface existed.
+impl IntoReactive<String> for &String {
+    fn into_reactive(self) -> Reactive<String> {
+        Reactive::Const(self.clone())
+    }
+}
+
+// Signal-bound: a `&State<T>` produces a Bound reactive. `State<T>::clone`
+// is cheap (Arc internals) so capturing it here doesn't allocate the
+// underlying graph again.
+impl<T: Clone + Send + 'static> IntoReactive<T> for &State<T> {
+    fn into_reactive(self) -> Reactive<T> {
+        Reactive::Bound(self.clone())
+    }
+}
+
+// Owned `State<T>` also works — convenient for `.bg(state.clone())`
+// patterns where the caller doesn't want to type a reference.
+impl<T: Clone + Send + 'static> IntoReactive<T> for State<T> {
+    fn into_reactive(self) -> Reactive<T> {
+        Reactive::Bound(self)
+    }
+}
+
+// Derived (computed) values — `&Computed<T>` produces a Computed
+// reactive. The Computed<T> wrapper bundles the DerivedId with the
+// reactive graph, so the binding has everything it needs to read
+// the current value on every fire.
+impl<T: Clone + Send + 'static> IntoReactive<T> for &Computed<T> {
+    fn into_reactive(self) -> Reactive<T> {
+        Reactive::Computed(self.clone())
+    }
+}
+
+impl<T: Clone + Send + 'static> IntoReactive<T> for Computed<T> {
+    fn into_reactive(self) -> Reactive<T> {
+        Reactive::Computed(self)
+    }
+}
+
+// Standalone signal: bridge a `Signal<T>` into the same `Reactive::Bound`
+// channel `&State<T>` uses, by wrapping it with the process-global
+// reactive graph + dirty flag. This lets `.bg(signal)` / `.bg(&signal)`
+// share the property-binding registry path with `.bg(&state)`.
+//
+// `Signal<T>` is `Copy`, so both impl arms are trivial — the by-value
+// form doesn't even need an explicit clone.
+impl<T: Clone + Send + 'static> IntoReactive<T> for Signal<T> {
+    fn into_reactive(self) -> Reactive<T> {
+        Reactive::Bound(State::new(
+            self,
+            blinc_core::reactive::global_graph(),
+            blinc_core::reactive::global_dirty_flag(),
+        ))
+    }
+}
+
+impl<T: Clone + Send + 'static> IntoReactive<T> for &Signal<T> {
+    fn into_reactive(self) -> Reactive<T> {
+        Reactive::Bound(State::new(
+            *self,
+            blinc_core::reactive::global_graph(),
+            blinc_core::reactive::global_dirty_flag(),
+        ))
+    }
+}
+
+// =========================================================================
+// PendingBinding — what Div / other element builders hold between method
+// chaining and `build()`. Each represents a deferred registration: at
+// build time, after the `LayoutNodeId` is minted, every pending binding
+// gets `register(node_id)` called on it.
+// =========================================================================
+
+/// Type-erased pending binding stored on `Div` (and other builders).
+/// Each element collects these as `.bg(&signal)` / `.opacity(&signal)` /
+/// etc. are called, then drains them in `build()` once the node id
+/// exists.
+pub trait PendingBinding: Send + Sync {
+    /// Register this binding against `node_id` in the global registry.
+    /// Called once during the element's `build()` after the layout node
+    /// is minted.
+    fn register(&self, node_id: LayoutNodeId);
+}
+
+/// Concrete typed-binding writer — `Arc<dyn Fn(&mut RenderProps, T)>`,
+/// generic over the value type. Lifted to a type alias so clippy's
+/// `type_complexity` lint doesn't fire on the `TypedPendingBinding`
+/// struct field.
+pub type TypedWriteFn<T> = Arc<dyn Fn(&mut RenderProps, T) + Send + Sync>;
+
+/// Source of a typed pending binding — either a single-signal
+/// `State<T>` (subscribed under a `SignalId`) or a derived
+/// `Computed<T>` (subscribed under a `DerivedId`). The PendingBinding
+/// impl dispatches on this enum at register-time so a single
+/// [`TypedPendingBinding`] type handles both surfaces.
+enum BindingSource<T: Clone + Send + Sync + 'static> {
+    Signal(State<T>),
+    Derived(Computed<T>),
+}
+
+/// Concrete `PendingBinding` for a typed `(BindingSource<T>, write:
+/// fn(&mut RenderProps, T))` triple. Held on the element builder via
+/// `Box<dyn PendingBinding>`. Originally only carried `State<T>`;
+/// extended in the Phase 8 follow-up (Derived ↔ IntoReactive bridge)
+/// to also carry `Computed<T>` so `Reactive::Computed` arms reuse the
+/// same struct.
+pub struct TypedPendingBinding<T: Clone + Send + Sync + 'static> {
+    source: BindingSource<T>,
+    property: PropertyId,
+    write: TypedWriteFn<T>,
+}
+
+impl<T: Clone + Send + Sync + 'static> TypedPendingBinding<T> {
+    /// Build a pending binding that, when registered against a node,
+    /// will subscribe to `state` and write its values into `RenderProps`
+    /// via `write` whenever the signal fires.
+    pub fn new(
+        state: State<T>,
+        property: PropertyId,
+        write: impl Fn(&mut RenderProps, T) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            source: BindingSource::Signal(state),
+            property,
+            write: Arc::new(write),
+        }
+    }
+
+    /// Build a pending binding backed by a `Computed<T>` — fires when
+    /// any of the computed's dependencies (recursive) change.
+    pub fn from_computed(
+        computed: Computed<T>,
+        property: PropertyId,
+        write: impl Fn(&mut RenderProps, T) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            source: BindingSource::Derived(computed),
+            property,
+            write: Arc::new(write),
+        }
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> PendingBinding for TypedPendingBinding<T> {
+    fn register(&self, node_id: LayoutNodeId) {
+        let write = Arc::clone(&self.write);
+        match &self.source {
+            BindingSource::Signal(state) => {
+                register_typed(
+                    state.signal_id(),
+                    node_id,
+                    self.property,
+                    state.clone(),
+                    move |p, v| write(p, v),
+                );
+            }
+            BindingSource::Derived(computed) => {
+                register_typed_computed(
+                    computed.derived_id(),
+                    node_id,
+                    self.property,
+                    computed.clone(),
+                    move |p, v| write(p, v),
+                );
+            }
+        }
+    }
+}
+
+/// Closure type for taffy-style writes — `Arc<dyn Fn(&mut taffy::Style,
+/// T)>`. Mirror of [`TypedWriteFn`] for the layout-binding path.
+pub type TypedLayoutWriteFn<T> = Arc<dyn Fn(&mut taffy::Style, T) + Send + Sync>;
+
+/// Layout-binding variant of [`TypedPendingBinding`]. Fires
+/// `queue_layout_update_partial` on every signal change, which patches
+/// the live taffy `Style` and triggers relayout next frame.
+///
+/// Used by Phase 2.4 layout-affecting builder methods (`.w(&signal)`,
+/// `.h(&signal)`, `.padding(&signal)`, etc.).
+pub struct LayoutPendingBinding<T: Clone + Send + Sync + 'static> {
+    source: BindingSource<T>,
+    property: PropertyId,
+    write: TypedLayoutWriteFn<T>,
+}
+
+impl<T: Clone + Send + Sync + 'static> LayoutPendingBinding<T> {
+    /// Build a layout-targeting pending binding. When registered against
+    /// a node, every `state.set(...)` fires a partial update whose
+    /// `layout_write` closure mutates the taffy `Style` via `write`.
+    pub fn new(
+        state: State<T>,
+        property: PropertyId,
+        write: impl Fn(&mut taffy::Style, T) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            source: BindingSource::Signal(state),
+            property,
+            write: Arc::new(write),
+        }
+    }
+
+    /// Build a layout-targeting pending binding backed by a
+    /// `Computed<T>` — fires when any of the computed's dependencies
+    /// set. Symmetric with [`TypedPendingBinding::from_computed`].
+    pub fn from_computed(
+        computed: Computed<T>,
+        property: PropertyId,
+        write: impl Fn(&mut taffy::Style, T) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            source: BindingSource::Derived(computed),
+            property,
+            write: Arc::new(write),
+        }
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> PendingBinding for LayoutPendingBinding<T> {
+    fn register(&self, node_id: LayoutNodeId) {
+        let write = Arc::clone(&self.write);
+        let property = self.property;
+        match &self.source {
+            BindingSource::Signal(state) => {
+                register_typed_layout(
+                    state.signal_id(),
+                    node_id,
+                    property,
+                    state.clone(),
+                    move |style, v| write(style, v),
+                );
+            }
+            BindingSource::Derived(computed) => {
+                register_typed_layout_computed(
+                    computed.derived_id(),
+                    node_id,
+                    property,
+                    computed.clone(),
+                    move |style, v| write(style, v),
+                );
+            }
+        }
+    }
+}
+
+/// Text-content variant of [`TypedPendingBinding`]: every change of a
+/// `String` source queues the new content for the node, so a text element
+/// follows its signal without its subtree being rebuilt.
+pub struct TextPendingBinding {
+    source: BindingSource<String>,
+    /// Applied to each new value before it is shown, so updated text is
+    /// treated like the text the element was built with.
+    normalize: fn(String) -> String,
+}
+
+impl TextPendingBinding {
+    /// Follow a `State<String>`.
+    pub fn new(state: State<String>, normalize: fn(String) -> String) -> Self {
+        Self {
+            source: BindingSource::Signal(state),
+            normalize,
+        }
+    }
+
+    /// Follow a `Computed<String>`.
+    pub fn from_computed(computed: Computed<String>, normalize: fn(String) -> String) -> Self {
+        Self {
+            source: BindingSource::Derived(computed),
+            normalize,
+        }
+    }
+}
+
+impl PendingBinding for TextPendingBinding {
+    fn register(&self, node_id: LayoutNodeId) {
+        let normalize = self.normalize;
+        let write: TextWriteFn = Arc::new(move |value: &BoundValue| {
+            value
+                .downcast_ref::<String>()
+                .map(|text| normalize(text.clone()))
+        });
+        let property = PropertyId::TextContent;
+        match &self.source {
+            BindingSource::Signal(state) => {
+                let state_for_read = state.clone();
+                let read: ReadFn = Arc::new(move || state_for_read.try_get().map(BoundValue::new));
+                with_registry(|reg| {
+                    reg.register_text(state.signal_id(), node_id, property, read, write)
+                });
+            }
+            BindingSource::Derived(computed) => {
+                let computed_for_read = computed.clone();
+                let read: ReadFn =
+                    Arc::new(move || computed_for_read.try_get().map(BoundValue::new));
+                with_registry(|reg| {
+                    reg.register_derived_text(computed.derived_id(), node_id, property, read, write)
+                });
+            }
+        }
+    }
+}
+
+/// A region of a node, kept up to date with the derived it reads its rows from.
+pub struct RegionPendingBinding {
+    derived_id: DerivedId,
+    read: ReadFn,
+    region: u64,
+}
+
+impl RegionPendingBinding {
+    /// `touch` reads the source, which keeps it subscribed to what it reads
+    /// each time it changes.
+    pub fn new(
+        derived_id: DerivedId,
+        region: u64,
+        touch: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            derived_id,
+            read: Arc::new(move || touch().then(|| BoundValue::new(()))),
+            region,
+        }
+    }
+}
+
+impl PendingBinding for RegionPendingBinding {
+    fn register(&self, node_id: LayoutNodeId) {
+        let read = Arc::clone(&self.read);
+        with_registry(|reg| {
+            reg.register_derived_region(self.derived_id, node_id, self.region, read)
+        });
+    }
+}
+
+/// A class that a node has while a `bool` source holds.
+pub struct ClassPendingBinding {
+    source: BindingSource<bool>,
+    class: Arc<str>,
+}
+
+impl ClassPendingBinding {
+    /// Follow a `State<bool>`.
+    pub fn new(state: State<bool>, class: Arc<str>) -> Self {
+        Self {
+            source: BindingSource::Signal(state),
+            class,
+        }
+    }
+
+    /// Follow a `Computed<bool>`.
+    pub fn from_computed(computed: Computed<bool>, class: Arc<str>) -> Self {
+        Self {
+            source: BindingSource::Derived(computed),
+            class,
+        }
+    }
+}
+
+impl PendingBinding for ClassPendingBinding {
+    fn register(&self, node_id: LayoutNodeId) {
+        let class = Arc::clone(&self.class);
+        match &self.source {
+            BindingSource::Signal(state) => {
+                let initial = state.try_get().unwrap_or(false);
+                let state_for_read = state.clone();
+                let read: ReadFn = Arc::new(move || state_for_read.try_get().map(BoundValue::new));
+                with_registry(|reg| {
+                    reg.register_class(state.signal_id(), node_id, initial, read, class)
+                });
+            }
+            BindingSource::Derived(computed) => {
+                let initial = computed.try_get().unwrap_or(false);
+                let computed_for_read = computed.clone();
+                let read: ReadFn =
+                    Arc::new(move || computed_for_read.try_get().map(BoundValue::new));
+                with_registry(|reg| {
+                    reg.register_derived_class(computed.derived_id(), node_id, initial, read, class)
+                });
+            }
+        }
+    }
+}
+
+// =========================================================================
+// Registry
+// =========================================================================
+
+/// What target a subscriber writes into when its signal fires.
+/// Visual props write `RenderProps`; layout props write the taffy
+/// `Style` (and trigger `compute_layout` next frame via the side-effect
+/// metadata).
+enum SubscriberWrite {
+    Render(WriteFn),
+    Layout(LayoutWriteFn),
+    Text(TextWriteFn),
+    /// Adds or removes this class on the node, by the bool the source holds.
+    Class(Arc<str>),
+    /// Brings the rows of this region of the node up to date.
+    Region(u64),
+}
+
+/// A class a node has while a source holds.
+#[derive(Clone)]
+pub struct ClassToggleInfo {
+    pub class: Arc<str>,
+    /// Whether the source held when the binding was made.
+    pub initial: bool,
+    read: ReadFn,
+}
+
+impl ClassToggleInfo {
+    /// Whether the source holds now.
+    pub fn current(&self) -> bool {
+        (self.read)()
+            .and_then(|value| value.downcast_ref::<bool>().copied())
+            .unwrap_or(self.initial)
+    }
+}
+
+struct Subscriber {
+    node_id: LayoutNodeId,
+    property: PropertyId,
+    read: ReadFn,
+    write: SubscriberWrite,
+}
+
+/// Signal-bound and derived-bound property subscribers for one tree namespace.
+///
+/// Two parallel index tables — one keyed by `SignalId` (driven by
+/// `State<T>::set` → `notify_property_bindings`) and one keyed by
+/// `DerivedId` (driven by `ReactiveGraph::set`'s dirty propagation →
+/// `notify_property_bindings_for_derived`). Both go through the same
+/// `Subscriber` struct + `fire` dispatch logic; only the key namespace
+/// differs.
+pub struct PropertyBindingRegistry {
+    /// `signal_id → list of subscribers waiting on that signal`.
+    bindings: HashMap<SignalId, Vec<Subscriber>>,
+    /// `derived_id → list of subscribers waiting on that derived`.
+    /// Parallels `bindings` for `Computed<T>`-backed subscriptions.
+    derived_bindings: HashMap<DerivedId, Vec<Subscriber>>,
+    /// `node_id → list of signal_ids that node subscribed to`.
+    /// Used by `unregister_node` to evict in O(per-binding-on-that-node)
+    /// time instead of scanning every signal's subscriber list.
+    by_node: HashMap<LayoutNodeId, Vec<SignalId>>,
+    /// Parallel reverse index for derived subscriptions — same role
+    /// as `by_node` but for the `derived_bindings` map.
+    derived_by_node: HashMap<LayoutNodeId, Vec<DerivedId>>,
+    /// The classes each node has while a source holds. The tree reads this
+    /// to know which nodes restyle when a class comes and goes.
+    class_toggles: HashMap<LayoutNodeId, Vec<ClassToggleInfo>>,
+}
+
+impl PropertyBindingRegistry {
+    fn new() -> Self {
+        Self {
+            bindings: HashMap::new(),
+            derived_bindings: HashMap::new(),
+            by_node: HashMap::new(),
+            derived_by_node: HashMap::new(),
+            class_toggles: HashMap::new(),
+        }
+    }
+
+    /// Nodes that have a class which follows a source, with those classes.
+    pub fn class_toggles(&self) -> Vec<(LayoutNodeId, Vec<ClassToggleInfo>)> {
+        self.class_toggles
+            .iter()
+            .map(|(node, infos)| (*node, infos.clone()))
+            .collect()
+    }
+
+    /// Follow a `State<bool>` that adds and removes `class` on a node.
+    pub fn register_class(
+        &mut self,
+        signal_id: SignalId,
+        node_id: LayoutNodeId,
+        initial: bool,
+        read: ReadFn,
+        class: Arc<str>,
+    ) {
+        self.class_toggles
+            .entry(node_id)
+            .or_default()
+            .push(ClassToggleInfo {
+                class: Arc::clone(&class),
+                initial,
+                read: Arc::clone(&read),
+            });
+        self.bindings
+            .entry(signal_id)
+            .or_default()
+            .push(Subscriber {
+                node_id,
+                property: PropertyId::Class,
+                read,
+                write: SubscriberWrite::Class(class),
+            });
+        self.by_node.entry(node_id).or_default().push(signal_id);
+    }
+
+    /// Follow the derived that a region of a node reads its rows from.
+    pub fn register_derived_region(
+        &mut self,
+        derived_id: DerivedId,
+        node_id: LayoutNodeId,
+        region: u64,
+        read: ReadFn,
+    ) {
+        self.derived_bindings
+            .entry(derived_id)
+            .or_default()
+            .push(Subscriber {
+                node_id,
+                property: PropertyId::Region,
+                read,
+                write: SubscriberWrite::Region(region),
+            });
+        self.derived_by_node
+            .entry(node_id)
+            .or_default()
+            .push(derived_id);
+    }
+
+    /// Counterpart of [`Self::register_class`] for a `Computed<bool>`.
+    pub fn register_derived_class(
+        &mut self,
+        derived_id: DerivedId,
+        node_id: LayoutNodeId,
+        initial: bool,
+        read: ReadFn,
+        class: Arc<str>,
+    ) {
+        self.class_toggles
+            .entry(node_id)
+            .or_default()
+            .push(ClassToggleInfo {
+                class: Arc::clone(&class),
+                initial,
+                read: Arc::clone(&read),
+            });
+        self.derived_bindings
+            .entry(derived_id)
+            .or_default()
+            .push(Subscriber {
+                node_id,
+                property: PropertyId::Class,
+                read,
+                write: SubscriberWrite::Class(class),
+            });
+        self.derived_by_node
+            .entry(node_id)
+            .or_default()
+            .push(derived_id);
+    }
+
+    /// Register a signal-bound subscription. Called by `Div::build` (or
+    /// the equivalent collection pass) for every reactive modifier on
+    /// the element, after the `LayoutNodeId` has been minted.
+    ///
+    /// `read` reads the current value from the signal's reactive graph;
+    /// `write` writes that value into the right `RenderProps` field.
+    /// Both are stored as `Arc<dyn Fn>` so the registry can hold
+    /// heterogeneous subscribers in one table.
+    pub fn register(
+        &mut self,
+        signal_id: SignalId,
+        node_id: LayoutNodeId,
+        property: PropertyId,
+        read: ReadFn,
+        write: WriteFn,
+    ) {
+        self.bindings
+            .entry(signal_id)
+            .or_default()
+            .push(Subscriber {
+                node_id,
+                property,
+                read,
+                write: SubscriberWrite::Render(write),
+            });
+        self.by_node.entry(node_id).or_default().push(signal_id);
+    }
+
+    /// Register a derived-bound subscription. The `read` closure
+    /// reads the current value of a `Derived<T>` via the supplied
+    /// graph; fired by `notify_property_bindings_for_derived` when
+    /// any of the derived's dependencies set. Otherwise identical to
+    /// [`Self::register`].
+    pub fn register_derived(
+        &mut self,
+        derived_id: DerivedId,
+        node_id: LayoutNodeId,
+        property: PropertyId,
+        read: ReadFn,
+        write: WriteFn,
+    ) {
+        self.derived_bindings
+            .entry(derived_id)
+            .or_default()
+            .push(Subscriber {
+                node_id,
+                property,
+                read,
+                write: SubscriberWrite::Render(write),
+            });
+        self.derived_by_node
+            .entry(node_id)
+            .or_default()
+            .push(derived_id);
+    }
+
+    /// Register a derived-bound *layout-targeting* subscription —
+    /// `register_derived` is for `RenderProps` writes; this is the
+    /// taffy-Style sibling. Fires the same way (via the derived
+    /// notifier) but the write closure mutates `taffy::Style`.
+    pub fn register_derived_layout(
+        &mut self,
+        derived_id: DerivedId,
+        node_id: LayoutNodeId,
+        property: PropertyId,
+        read: ReadFn,
+        write: LayoutWriteFn,
+    ) {
+        self.derived_bindings
+            .entry(derived_id)
+            .or_default()
+            .push(Subscriber {
+                node_id,
+                property,
+                read,
+                write: SubscriberWrite::Layout(write),
+            });
+        self.derived_by_node
+            .entry(node_id)
+            .or_default()
+            .push(derived_id);
+    }
+
+    /// Register a layout-targeting subscription. The `write` closure
+    /// mutates the live taffy `Style` (instead of `RenderProps`) on
+    /// every signal fire; the side-effect metadata on `property` tells
+    /// the drain step to schedule `compute_layout` next frame.
+    pub fn register_layout(
+        &mut self,
+        signal_id: SignalId,
+        node_id: LayoutNodeId,
+        property: PropertyId,
+        read: ReadFn,
+        write: LayoutWriteFn,
+    ) {
+        self.bindings
+            .entry(signal_id)
+            .or_default()
+            .push(Subscriber {
+                node_id,
+                property,
+                read,
+                write: SubscriberWrite::Layout(write),
+            });
+        self.by_node.entry(node_id).or_default().push(signal_id);
+    }
+
+    /// Register a signal-bound subscription that replaces a text node's
+    /// content. Counterpart to [`Self::register`] for text.
+    pub fn register_text(
+        &mut self,
+        signal_id: SignalId,
+        node_id: LayoutNodeId,
+        property: PropertyId,
+        read: ReadFn,
+        write: TextWriteFn,
+    ) {
+        self.bindings
+            .entry(signal_id)
+            .or_default()
+            .push(Subscriber {
+                node_id,
+                property,
+                read,
+                write: SubscriberWrite::Text(write),
+            });
+        self.by_node.entry(node_id).or_default().push(signal_id);
+    }
+
+    /// Register a derived-bound subscription that replaces a text node's
+    /// content. Counterpart to [`Self::register_derived`] for text.
+    pub fn register_derived_text(
+        &mut self,
+        derived_id: DerivedId,
+        node_id: LayoutNodeId,
+        property: PropertyId,
+        read: ReadFn,
+        write: TextWriteFn,
+    ) {
+        self.derived_bindings
+            .entry(derived_id)
+            .or_default()
+            .push(Subscriber {
+                node_id,
+                property,
+                read,
+                write: SubscriberWrite::Text(write),
+            });
+        self.derived_by_node
+            .entry(node_id)
+            .or_default()
+            .push(derived_id);
+    }
+
+    /// Evict every subscription belonging to the given node. Called by
+    /// `remove_subtree_nodes` so stale subscribers can't fire on the
+    /// next signal change after a structural rebuild dropped the node.
+    pub fn unregister_node(&mut self, node_id: LayoutNodeId) {
+        self.class_toggles.remove(&node_id);
+        if let Some(signal_ids) = self.by_node.remove(&node_id) {
+            for sig_id in signal_ids {
+                if let Some(subs) = self.bindings.get_mut(&sig_id) {
+                    subs.retain(|s| s.node_id != node_id);
+                    if subs.is_empty() {
+                        self.bindings.remove(&sig_id);
+                    }
+                }
+            }
+        }
+        if let Some(derived_ids) = self.derived_by_node.remove(&node_id) {
+            for d_id in derived_ids {
+                if let Some(subs) = self.derived_bindings.get_mut(&d_id) {
+                    subs.retain(|s| s.node_id != node_id);
+                    if subs.is_empty() {
+                        self.derived_bindings.remove(&d_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop every subscription to a signal that no longer exists.
+    pub fn unregister_signal(&mut self, signal_id: SignalId) {
+        let Some(subs) = self.bindings.remove(&signal_id) else {
+            return;
+        };
+        for sub in subs {
+            if let Some(ids) = self.by_node.get_mut(&sub.node_id) {
+                ids.retain(|s| *s != signal_id);
+                if ids.is_empty() {
+                    self.by_node.remove(&sub.node_id);
+                }
+            }
+        }
+    }
+
+    /// Drop every subscription to a derived that no longer exists.
+    pub fn unregister_derived(&mut self, derived_id: DerivedId) {
+        let Some(subs) = self.derived_bindings.remove(&derived_id) else {
+            return;
+        };
+        for sub in subs {
+            if let Some(ids) = self.derived_by_node.get_mut(&sub.node_id) {
+                ids.retain(|d| *d != derived_id);
+                if ids.is_empty() {
+                    self.derived_by_node.remove(&sub.node_id);
+                }
+            }
+        }
+    }
+
+    /// Walk every subscriber waiting on `signal_id` and queue a partial
+    /// property update for each. Called by the global notifier from
+    /// `blinc_core::reactive::set_property_binding_notifier` whenever a
+    /// `State<T>::set` (or `update`) fires.
+    pub fn fire(&self, signal_id: SignalId) {
+        let Some(subs) = self.bindings.get(&signal_id) else {
+            return;
+        };
+        Self::dispatch_subscribers(subs);
+    }
+
+    /// Walk every subscriber waiting on `derived_id` and queue a
+    /// partial property update for each. Called by the parallel
+    /// derived-binding notifier when `ReactiveGraph::set` propagates
+    /// dirty markers through derived chains.
+    pub fn fire_derived(&self, derived_id: DerivedId) {
+        let Some(subs) = self.derived_bindings.get(&derived_id) else {
+            return;
+        };
+        Self::dispatch_subscribers(subs);
+    }
+
+    /// Queue an update for every binding of `node_id` from its source's current value.
+    ///
+    /// A binding learns of a change when its source fires, and one registered after the change
+    /// has missed it: a node built, then mounted a moment later, after something wrote a source
+    /// in between, keeps the value it was built with.
+    pub fn refresh_node(&self, node_id: LayoutNodeId) {
+        for signal_id in self.by_node.get(&node_id).into_iter().flatten() {
+            if let Some(subs) = self.bindings.get(signal_id) {
+                let own: Vec<&Subscriber> =
+                    subs.iter().filter(|sub| sub.node_id == node_id).collect();
+                Self::dispatch_subscriber_refs(&own);
+            }
+        }
+        for derived_id in self.derived_by_node.get(&node_id).into_iter().flatten() {
+            if let Some(subs) = self.derived_bindings.get(derived_id) {
+                let own: Vec<&Subscriber> =
+                    subs.iter().filter(|sub| sub.node_id == node_id).collect();
+                Self::dispatch_subscriber_refs(&own);
+            }
+        }
+    }
+
+    fn dispatch_subscribers(subs: &[Subscriber]) {
+        Self::dispatch_subscriber_refs(&subs.iter().collect::<Vec<_>>());
+    }
+
+    fn dispatch_subscriber_refs(subs: &[&Subscriber]) {
+        for sub in subs {
+            let Some(value) = (sub.read)() else {
+                continue;
+            };
+            match &sub.write {
+                SubscriberWrite::Render(write) => {
+                    let (write, beneath) = (Arc::clone(write), Arc::clone(write));
+                    let value = Arc::new(value);
+                    let beneath_value = Arc::clone(&value);
+                    queue_prop_update_partial_beneath(
+                        sub.node_id,
+                        sub.property,
+                        sub.property.side_effects(),
+                        move |props| write(props, &value),
+                        move |props| beneath(props, &beneath_value),
+                    );
+                }
+                SubscriberWrite::Layout(write) => {
+                    let (write, beneath) = (Arc::clone(write), Arc::clone(write));
+                    let value = Arc::new(value);
+                    let beneath_value = Arc::clone(&value);
+                    crate::stateful::queue_layout_update_partial_beneath(
+                        sub.node_id,
+                        sub.property,
+                        sub.property.side_effects(),
+                        move |style| write(style, &value),
+                        move |style| beneath(style, &beneath_value),
+                    );
+                }
+                SubscriberWrite::Text(text_of) => {
+                    if let Some(content) = text_of(&value) {
+                        queue_text_update(sub.node_id, sub.property, content);
+                    }
+                }
+                SubscriberWrite::Class(class) => {
+                    if let Some(on) = value.downcast_ref::<bool>() {
+                        crate::stateful::queue_class_toggle(sub.node_id, Arc::clone(class), *on);
+                    }
+                }
+                SubscriberWrite::Region(region) => {
+                    crate::stateful::queue_region_update(sub.node_id, *region);
+                }
+            }
+        }
+    }
+
+    /// Number of unique signals currently subscribed to. For diagnostics
+    /// / tests.
+    pub fn signal_count(&self) -> usize {
+        self.bindings.len()
+    }
+
+    /// Number of unique derived values currently subscribed to.
+    /// For diagnostics / tests.
+    pub fn derived_count(&self) -> usize {
+        self.derived_bindings.len()
+    }
+
+    /// Number of subscribers for `signal_id`. For diagnostics / tests.
+    pub fn subscriber_count(&self, signal_id: SignalId) -> usize {
+        self.bindings.get(&signal_id).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Number of subscribers for `derived_id`. For diagnostics /
+    /// tests.
+    pub fn derived_subscriber_count(&self, derived_id: DerivedId) -> usize {
+        self.derived_bindings
+            .get(&derived_id)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
+    /// Drop every binding. Test-only: each test creates a fresh
+    /// `ReactiveGraph` whose signal-id counter restarts at 0, so test
+    /// runs share signal ids and would observe each other's subscribers
+    /// without an explicit reset.
+    #[cfg(test)]
+    pub fn clear_for_tests(&mut self) {
+        self.bindings.clear();
+        self.derived_bindings.clear();
+        self.by_node.clear();
+        self.derived_by_node.clear();
+    }
+}
+
+// Each tree has an independent registry; core notifications fan out by source.
+static REGISTRY_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static REGISTRY: LazyLock<Mutex<HashMap<u64, PropertyBindingRegistry>>> = LazyLock::new(|| {
+    blinc_core::reactive::set_property_binding_notifier(|id| {
+        with_registries(|registry| registry.fire(id));
+    });
+    blinc_core::reactive::set_derived_binding_notifier(|id| {
+        with_registries(|registry| registry.fire_derived(id));
+    });
+    blinc_core::reactive::set_dispose_notifier(|disposed| {
+        with_registries(|registry| match disposed {
+            blinc_core::reactive::Disposed::Signal(id) => registry.unregister_signal(id),
+            blinc_core::reactive::Disposed::Derived(id) => registry.unregister_derived(id),
+        });
+    });
+    Mutex::new(HashMap::new())
+});
+
+fn remove_retired(
+    registries: &mut HashMap<u64, PropertyBindingRegistry>,
+) -> Vec<PropertyBindingRegistry> {
+    crate::tree::scope::take_retired()
+        .into_iter()
+        .filter_map(|scope| registries.remove(&scope))
+        .collect()
+}
+
+pub(crate) fn sweep_retired_scopes() {
+    let removed = REGISTRY
+        .try_lock()
+        .ok()
+        .map(|mut all| remove_retired(&mut all));
+    drop(removed);
+}
+
+pub(crate) fn registry_is_initialized() -> bool {
+    REGISTRY_READY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn with_registries(mut f: impl FnMut(&mut PropertyBindingRegistry)) {
+    let mut all = REGISTRY.lock().unwrap();
+    REGISTRY_READY.store(true, std::sync::atomic::Ordering::Release);
+    let removed = remove_retired(&mut all);
+    for (&scope, registry) in all.iter_mut() {
+        let _scope = crate::tree::scope::enter(scope);
+        f(registry);
+    }
+    drop(all);
+    drop(removed);
+}
+
+/// Access the current tree's binding registry, or the legacy unscoped registry.
+/// Custom callers can use `RenderTree::with_property_updates` to select a tree.
+pub fn with_registry<R>(f: impl FnOnce(&mut PropertyBindingRegistry) -> R) -> R {
+    let mut all = REGISTRY.lock().unwrap();
+    REGISTRY_READY.store(true, std::sync::atomic::Ordering::Release);
+    let removed = remove_retired(&mut all);
+    let registry = all
+        .entry(crate::tree::scope::current())
+        .or_insert_with(PropertyBindingRegistry::new);
+    let result = f(registry);
+    drop(all);
+    drop(removed);
+    result
+}
+
+/// Convenience: register a signal-bound subscription using a typed
+/// `State<T>` + a typed writer. Wraps the boilerplate of constructing
+/// the type-erased `read` + `write` closures.
+///
+/// This is the API `Div` builder methods will call internally in P2.2+.
+pub fn register_typed<T>(
+    signal_id: SignalId,
+    node_id: LayoutNodeId,
+    property: PropertyId,
+    state: blinc_core::reactive::State<T>,
+    write: impl Fn(&mut RenderProps, T) + Send + Sync + 'static,
+) where
+    T: Clone + Send + Sync + 'static,
+{
+    let write = Arc::new(write);
+    let state_for_read = state.clone();
+    let read: ReadFn = Arc::new(move || state_for_read.try_get().map(BoundValue::new));
+    let write_dyn: WriteFn = {
+        let write = Arc::clone(&write);
+        Arc::new(move |props: &mut RenderProps, val: &BoundValue| {
+            if let Some(v) = val.downcast_ref::<T>() {
+                write(props, v.clone());
+            }
+        })
+    };
+    with_registry(|reg| reg.register(signal_id, node_id, property, read, write_dyn));
+}
+
+/// Convenience: register a derived-bound subscription using a typed
+/// `Computed<T>` + a typed writer. Mirror of [`register_typed`] for
+/// the derived path — sits behind `TypedPendingBinding::from_computed`
+/// and the `Reactive::Computed` arm of every reactive builder.
+pub fn register_typed_computed<T>(
+    derived_id: DerivedId,
+    node_id: LayoutNodeId,
+    property: PropertyId,
+    computed: Computed<T>,
+    write: impl Fn(&mut RenderProps, T) + Send + Sync + 'static,
+) where
+    T: Clone + Send + Sync + 'static,
+{
+    let write = Arc::new(write);
+    let computed_for_read = computed.clone();
+    let read: ReadFn = Arc::new(move || computed_for_read.try_get().map(BoundValue::new));
+    let write_dyn: WriteFn = {
+        let write = Arc::clone(&write);
+        Arc::new(move |props: &mut RenderProps, val: &BoundValue| {
+            if let Some(v) = val.downcast_ref::<T>() {
+                write(props, v.clone());
+            }
+        })
+    };
+    with_registry(|reg| reg.register_derived(derived_id, node_id, property, read, write_dyn));
+}
+
+/// Convenience: register a derived-bound layout-targeting
+/// subscription. Mirror of [`register_typed_layout`] for the derived
+/// path — sits behind `LayoutPendingBinding::from_computed`.
+pub fn register_typed_layout_computed<T>(
+    derived_id: DerivedId,
+    node_id: LayoutNodeId,
+    property: PropertyId,
+    computed: Computed<T>,
+    write: impl Fn(&mut taffy::Style, T) + Send + Sync + 'static,
+) where
+    T: Clone + Send + Sync + 'static,
+{
+    let write = Arc::new(write);
+    let computed_for_read = computed.clone();
+    let read: ReadFn = Arc::new(move || computed_for_read.try_get().map(BoundValue::new));
+    let write_dyn: LayoutWriteFn = {
+        let write = Arc::clone(&write);
+        Arc::new(move |style: &mut taffy::Style, val: &BoundValue| {
+            if let Some(v) = val.downcast_ref::<T>() {
+                write(style, v.clone());
+            }
+        })
+    };
+    with_registry(|reg| {
+        reg.register_derived_layout(derived_id, node_id, property, read, write_dyn)
+    });
+}
+
+/// Convenience: register a layout-targeting signal-bound subscription.
+/// Counterpart to [`register_typed`] for layout-affecting properties.
+/// The supplied `write` closure mutates the live taffy `Style` (instead
+/// of `RenderProps`) on every signal fire.
+pub fn register_typed_layout<T>(
+    signal_id: SignalId,
+    node_id: LayoutNodeId,
+    property: PropertyId,
+    state: blinc_core::reactive::State<T>,
+    write: impl Fn(&mut taffy::Style, T) + Send + Sync + 'static,
+) where
+    T: Clone + Send + Sync + 'static,
+{
+    let write = Arc::new(write);
+    let state_for_read = state.clone();
+    let read: ReadFn = Arc::new(move || state_for_read.try_get().map(BoundValue::new));
+    let write_dyn: LayoutWriteFn = {
+        let write = Arc::clone(&write);
+        Arc::new(move |style: &mut taffy::Style, val: &BoundValue| {
+            if let Some(v) = val.downcast_ref::<T>() {
+                write(style, v.clone());
+            }
+        })
+    };
+    with_registry(|reg| reg.register_layout(signal_id, node_id, property, read, write_dyn));
+}
+
+/// Queue an update for every binding of `node_id` from its source's current value; see
+/// [`PropertyBindingRegistry::refresh_node`].
+pub fn refresh_node(node_id: LayoutNodeId) {
+    with_registry(|reg| reg.refresh_node(node_id));
+}
+
+/// Convenience: unregister all bindings for a node. Called by
+/// `remove_subtree_nodes` in the renderer cleanup path.
+pub fn unregister_node(node_id: LayoutNodeId) {
+    with_registry(|reg| reg.unregister_node(node_id));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blinc_core::reactive::{ReactiveGraph, State};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Serialise the binding tests — they share the process-global
+    /// registry, and each `fresh_state` call rebuilds a `ReactiveGraph`
+    /// whose signal-id counter restarts at 0. Without serialisation,
+    /// two parallel tests both register subscribers for `SignalId(0)`
+    /// and one test's `set()` fires the other's binding.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the lock + reset the registry to a clean state. Returns
+    /// a guard so the lock is held for the test body's duration.
+    fn lock_and_reset() -> std::sync::MutexGuard<'static, ()> {
+        // Poisoning on a previous test's panic shouldn't kill subsequent
+        // tests — recover from the poison so the suite keeps running.
+        let guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        with_registry(|r| r.clear_for_tests());
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        guard
+    }
+
+    /// Build a fresh `State<T>` over a private ReactiveGraph. Avoids
+    /// the BlincContextState global init (which is one-shot and can't
+    /// be reused across tests). Also touches the registry so the
+    /// LazyLock fires + installs the core notifier before the test
+    /// interacts with `State::set`.
+    fn fresh_state<T: Clone + Send + 'static>(initial: T) -> State<T> {
+        with_registry(|_| {});
+        let graph: Arc<Mutex<ReactiveGraph>> = Arc::new(Mutex::new(ReactiveGraph::new()));
+        let signal = graph.lock().unwrap().create_signal(initial);
+        let dirty: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        State::new(signal, graph, dirty)
+    }
+
+    fn mint_node(tree: &mut crate::tree::LayoutTree) -> LayoutNodeId {
+        tree.create_node(taffy::Style::default())
+    }
+
+    #[test]
+    fn register_then_fire_queues_partial_update() {
+        let _guard = lock_and_reset();
+        let state = fresh_state::<i32>(0);
+
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = mint_node(&mut tree);
+
+        let fire_count = Arc::new(AtomicUsize::new(0));
+        let fire_count_for_write = Arc::clone(&fire_count);
+        register_typed(
+            state.signal_id(),
+            node_id,
+            PropertyId::Background,
+            state.clone(),
+            move |_props, _v: i32| {
+                fire_count_for_write.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        // Set the signal — should fire one binding → one queued update.
+        state.set(42);
+
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1, "exactly one partial update queued");
+        assert_eq!(updates[0].node_id, node_id);
+        assert_eq!(updates[0].property, PropertyId::Background);
+
+        // Apply it to a RenderProps to invoke the writer.
+        let mut props = RenderProps::default();
+        (updates.into_iter().next().unwrap().render_write.unwrap())(&mut props);
+        assert_eq!(fire_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn disposing_a_signal_drops_its_bindings() {
+        let _guard = lock_and_reset();
+        let state = State::new(
+            blinc_core::reactive::signal(0i32),
+            blinc_core::reactive::global_graph(),
+            blinc_core::reactive::global_dirty_flag(),
+        );
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = mint_node(&mut tree);
+        register_typed(
+            state.signal_id(),
+            node_id,
+            PropertyId::Opacity,
+            state.clone(),
+            |props, v: i32| props.opacity = v as f32,
+        );
+        assert_eq!(with_registry(|r| r.subscriber_count(state.signal_id())), 1);
+
+        blinc_core::reactive::dispose_signal(state.signal_id());
+
+        assert_eq!(with_registry(|r| r.subscriber_count(state.signal_id())), 0);
+        assert!(with_registry(|r| !r.by_node.contains_key(&node_id)));
+        state.set(1);
+        assert!(crate::stateful::take_pending_partial_prop_updates().is_empty());
+    }
+
+    #[test]
+    fn disposing_a_derived_drops_its_bindings() {
+        let _guard = lock_and_reset();
+        let source = blinc_core::reactive::signal(2i32);
+        let doubled =
+            blinc_core::reactive::computed::<i32, _>(move |_| source.try_get().unwrap_or(0) * 2);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = mint_node(&mut tree);
+        register_typed_computed(
+            doubled.derived_id(),
+            node_id,
+            PropertyId::Opacity,
+            doubled.clone(),
+            |props, v: i32| props.opacity = v as f32,
+        );
+        assert_eq!(
+            with_registry(|r| r.derived_subscriber_count(doubled.derived_id())),
+            1
+        );
+
+        blinc_core::reactive::dispose_derived(doubled.derived_id());
+
+        assert_eq!(
+            with_registry(|r| r.derived_subscriber_count(doubled.derived_id())),
+            0
+        );
+        assert!(with_registry(|r| !r.derived_by_node.contains_key(&node_id)));
+        source.set(3);
+        assert!(crate::stateful::take_pending_partial_prop_updates().is_empty());
+    }
+
+    #[test]
+    fn unregister_node_stops_firing() {
+        let _guard = lock_and_reset();
+        let state = fresh_state::<i32>(0);
+
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = mint_node(&mut tree);
+
+        register_typed(
+            state.signal_id(),
+            node_id,
+            PropertyId::Opacity,
+            state.clone(),
+            |_p, _v: i32| {},
+        );
+
+        // Sanity: registered.
+        assert_eq!(with_registry(|r| r.subscriber_count(state.signal_id())), 1);
+
+        unregister_node(node_id);
+
+        // After unregister: no subscribers, fire is a no-op.
+        assert_eq!(with_registry(|r| r.subscriber_count(state.signal_id())), 0);
+
+        state.set(99);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert!(
+            updates.is_empty(),
+            "unregistered binding must not fire (got {} updates)",
+            updates.len()
+        );
+    }
+
+    #[test]
+    fn multiple_subscribers_one_signal() {
+        let _guard = lock_and_reset();
+        let state = fresh_state::<i32>(0);
+
+        let mut tree = crate::tree::LayoutTree::new();
+        let n1 = mint_node(&mut tree);
+        let n2 = mint_node(&mut tree);
+        let n3 = mint_node(&mut tree);
+
+        for nid in [n1, n2, n3] {
+            register_typed(
+                state.signal_id(),
+                nid,
+                PropertyId::Background,
+                state.clone(),
+                |_p, _v: i32| {},
+            );
+        }
+
+        state.set(7);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 3, "all three subscribers fired");
+        assert!(updates.iter().any(|u| u.node_id == n1));
+        assert!(updates.iter().any(|u| u.node_id == n2));
+        assert!(updates.iter().any(|u| u.node_id == n3));
+    }
+
+    #[test]
+    fn unregister_removes_only_targeted_node() {
+        let _guard = lock_and_reset();
+        let state = fresh_state::<i32>(0);
+
+        let mut tree = crate::tree::LayoutTree::new();
+        let keep = mint_node(&mut tree);
+        let drop_node = mint_node(&mut tree);
+
+        register_typed(
+            state.signal_id(),
+            keep,
+            PropertyId::Background,
+            state.clone(),
+            |_p, _v: i32| {},
+        );
+        register_typed(
+            state.signal_id(),
+            drop_node,
+            PropertyId::Background,
+            state.clone(),
+            |_p, _v: i32| {},
+        );
+
+        unregister_node(drop_node);
+
+        state.set(1);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1, "only the surviving subscriber fired");
+        assert_eq!(updates[0].node_id, keep);
+    }
+
+    #[test]
+    fn into_reactive_const_path() {
+        // No registry interaction; doesn't need the lock.
+        let r = 42_i32.into_reactive();
+        match r {
+            Reactive::Const(v) => assert_eq!(v, 42),
+            Reactive::Bound(_) => panic!("expected Const"),
+            Reactive::Computed(_) => panic!("expected Const"),
+        }
+    }
+
+    #[test]
+    fn into_reactive_bound_path_from_state_ref() {
+        let _guard = lock_and_reset();
+        let state = fresh_state::<i32>(7);
+        let r = (&state).into_reactive();
+        match r {
+            Reactive::Const(_) => panic!("expected Bound"),
+            Reactive::Bound(s) => assert_eq!(s.try_get(), Some(7)),
+            Reactive::Computed(_) => panic!("&State must produce Bound, not Computed"),
+        }
+    }
+
+    #[test]
+    fn pending_binding_registers_and_fires() {
+        let _guard = lock_and_reset();
+        let state = fresh_state::<i32>(0);
+
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = mint_node(&mut tree);
+
+        // Pretend this is what a builder method does at chain time.
+        let pending =
+            TypedPendingBinding::new(state.clone(), PropertyId::Opacity, |_p, _v: i32| {});
+
+        // And this is what `build()` does after minting node_id.
+        pending.register(node_id);
+
+        // Fire the signal — the binding should queue an update.
+        state.set(123);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].node_id, node_id);
+        assert_eq!(updates[0].property, PropertyId::Opacity);
+    }
+
+    #[test]
+    fn div_bg_eager_path_unchanged() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+        use blinc_core::Color;
+
+        // Eager `.bg(Color)` — exercises the Const branch. No binding
+        // should be registered.
+        let mut tree = crate::tree::LayoutTree::new();
+        let element = div().bg(Color::from_hex(0xff0000));
+        let _node_id = element.build(&mut tree);
+
+        // No signal-bound bindings → registry stays empty.
+        assert_eq!(with_registry(|r| r.signal_count()), 0);
+    }
+
+    #[test]
+    fn div_bg_bound_path_fires_on_state_set() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+        use blinc_core::Color;
+
+        let bg_state = fresh_state::<Color>(Color::from_hex(0xff0000));
+        let element = div().bg(&bg_state);
+
+        // Initial value seeded into the builder before build.
+        let props = element.render_props();
+        assert!(props.background.is_some());
+
+        // Build the element — registration fires inside build().
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        assert_eq!(
+            with_registry(|r| r.subscriber_count(bg_state.signal_id())),
+            1,
+            "exactly one binding registered for this state"
+        );
+
+        // Drain any updates queued during build (none expected) so the
+        // fire check below measures cleanly.
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+
+        // Set the state — the binding fires → queue gets a partial update.
+        bg_state.set(Color::from_hex(0x00ff00));
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].node_id, node_id);
+        assert_eq!(updates[0].property, PropertyId::Background);
+
+        // Apply the queued update — RenderProps.background should reflect
+        // the new colour.
+        let mut props = RenderProps::default();
+        (updates.into_iter().next().unwrap().render_write.unwrap())(&mut props);
+        match props.background {
+            Some(blinc_core::Brush::Solid(c)) => {
+                assert_eq!(c, Color::from_hex(0x00ff00));
+            }
+            other => panic!("expected Solid green, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn div_opacity_bound_path_fires_on_state_set() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+
+        let opacity_state = fresh_state::<f32>(1.0);
+        let element = div().opacity(&opacity_state);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        opacity_state.set(0.5);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].node_id, node_id);
+        assert_eq!(updates[0].property, PropertyId::Opacity);
+
+        let mut props = RenderProps::default();
+        (updates.into_iter().next().unwrap().render_write.unwrap())(&mut props);
+        assert!((props.opacity - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn div_rounded_bound_path_fires_on_state_set() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+
+        let radius_state = fresh_state::<f32>(4.0);
+        let element = div().rounded(&radius_state);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        radius_state.set(16.0);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].node_id, node_id);
+        assert_eq!(updates[0].property, PropertyId::CornerRadius);
+
+        let mut props = RenderProps::default();
+        (updates.into_iter().next().unwrap().render_write.unwrap())(&mut props);
+        assert!((props.border_radius.top_left - 16.0).abs() < 1e-6);
+        assert!((props.border_radius.bottom_right - 16.0).abs() < 1e-6);
+        assert!(props.border_radius_explicit);
+    }
+
+    #[test]
+    fn div_border_color_bound_path_fires_on_state_set() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+        use blinc_core::Color;
+
+        let bc_state = fresh_state::<Color>(Color::from_hex(0x000000));
+        let element = div().border_color(&bc_state);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        bc_state.set(Color::from_hex(0xff8800));
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].node_id, node_id);
+        assert_eq!(updates[0].property, PropertyId::BorderColor);
+
+        let mut props = RenderProps::default();
+        (updates.into_iter().next().unwrap().render_write.unwrap())(&mut props);
+        assert_eq!(props.border_color, Some(Color::from_hex(0xff8800)));
+    }
+
+    #[test]
+    fn div_shadow_bound_path_fires_on_state_set() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+        use blinc_core::{Color, Shadow};
+
+        let initial = Shadow::new(0.0, 2.0, 4.0, Color::from_hex(0x000000));
+        let next = Shadow::new(0.0, 8.0, 16.0, Color::from_hex(0x222222));
+        let shadow_state = fresh_state::<Shadow>(initial);
+        let element = div().shadow(&shadow_state);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        shadow_state.set(next);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].node_id, node_id);
+        assert_eq!(updates[0].property, PropertyId::Shadow);
+
+        let mut props = RenderProps::default();
+        (updates.into_iter().next().unwrap().render_write.unwrap())(&mut props);
+        assert_eq!(props.shadow.len(), 1);
+        assert_eq!(props.shadow[0], next);
+    }
+
+    #[test]
+    fn div_transform_bound_path_fires_on_state_set() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+        use blinc_core::Transform;
+
+        let t_state = fresh_state::<Transform>(Transform::translate(0.0, 0.0));
+        let element = div().transform(&t_state);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        t_state.set(Transform::translate(10.0, 20.0));
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].node_id, node_id);
+        assert_eq!(updates[0].property, PropertyId::Transform);
+
+        let mut props = RenderProps::default();
+        (updates.into_iter().next().unwrap().render_write.unwrap())(&mut props);
+        assert!(props.transform.is_some());
+    }
+
+    /// Layout-binding path — `.w(&state)` should emit a `layout_write`
+    /// (not `render_write`) with `needs_layout = true`.
+    #[test]
+    fn div_w_bound_path_emits_layout_write() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+
+        let w_state = fresh_state::<f32>(100.0);
+        let element = div().w(&w_state);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        // Sanity: initial value seeded into taffy style.
+        let style = tree.get_style(node_id).expect("style");
+        assert!(
+            matches!(style.size.width.expand(), taffy::style::ExpandedDimension::Length(v) if (v - 100.0).abs() < 1e-6)
+        );
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        w_state.set(250.0);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        let upd = updates.into_iter().next().unwrap();
+        assert_eq!(upd.node_id, node_id);
+        assert_eq!(upd.property, PropertyId::Width);
+        assert!(
+            upd.effects.needs_layout,
+            "Width changes must trigger layout"
+        );
+        assert!(
+            upd.render_write.is_none(),
+            "Width is layout-only, no RenderProps write"
+        );
+        assert!(upd.layout_write.is_some(), "Width must have a layout_write");
+
+        // Apply the layout write — the taffy Style should pick up the new width.
+        let mut style = tree.get_style(node_id).unwrap();
+        (upd.layout_write.unwrap())(&mut style);
+        assert!(
+            matches!(style.size.width.expand(), taffy::style::ExpandedDimension::Length(v) if (v - 250.0).abs() < 1e-6)
+        );
+    }
+
+    #[test]
+    fn div_h_bound_path_emits_layout_write() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+
+        let h_state = fresh_state::<f32>(50.0);
+        let element = div().h(&h_state);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        h_state.set(75.0);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        let upd = updates.into_iter().next().unwrap();
+        assert_eq!(upd.property, PropertyId::Height);
+        assert!(upd.effects.needs_layout);
+        assert!(upd.layout_write.is_some());
+    }
+
+    #[test]
+    fn div_gap_bound_path_emits_layout_write() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+
+        let gap_state = fresh_state::<f32>(2.0); // 8px
+        let element = div().gap(&gap_state);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        gap_state.set(4.0); // 16px
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        let upd = updates.into_iter().next().unwrap();
+        assert_eq!(upd.property, PropertyId::Gap);
+        assert!(upd.effects.needs_layout);
+
+        let mut style = tree.get_style(node_id).unwrap();
+        (upd.layout_write.unwrap())(&mut style);
+        // gap units are 4px each — gap(4.0) → 16.0
+        match style.gap.width.expand() {
+            taffy::style::ExpandedLengthPercentage::Length(v) => assert!((v - 16.0).abs() < 1e-6),
+            other => panic!("expected Length, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn div_padding_bound_path_emits_layout_write() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+
+        let p_state = fresh_state::<f32>(2.0);
+        let element = div().p(&p_state);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        p_state.set(6.0); // 24px
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        let upd = updates.into_iter().next().unwrap();
+        assert_eq!(upd.property, PropertyId::Padding);
+        assert!(upd.effects.needs_layout);
+
+        let mut style = tree.get_style(node_id).unwrap();
+        (upd.layout_write.unwrap())(&mut style);
+        match style.padding.left.expand() {
+            taffy::style::ExpandedLengthPercentage::Length(v) => assert!((v - 24.0).abs() < 1e-6),
+            other => panic!("expected Length, got {other:?}"),
+        }
+    }
+
+    // ============================================================
+    // Phase 8.1 — transform_origin + transform_width +
+    // bind_transform_from. Layout-property animation helpers that
+    // route per-frame visual changes through a GPU scale transform
+    // instead of taffy::Style mutation, skipping compute_layout.
+    // ============================================================
+
+    #[test]
+    fn div_transform_origin_propagates_to_render_props() {
+        use crate::div::{ElementBuilder, div};
+        let element = div().transform_origin(0.0, 50.0);
+        let props = element.render_props();
+        assert_eq!(props.transform_origin, Some([0.0, 50.0]));
+    }
+
+    /// Pull `(sx, sy)` from a `Transform::scale(sx, sy)` value. Panics
+    /// if the supplied transform isn't a 2D affine produced by
+    /// `Transform::scale` (the only shape `transform_width`
+    /// and the cn::progress mapper emit).
+    fn affine_scale(t: &blinc_core::Transform) -> (f32, f32) {
+        match t {
+            blinc_core::Transform::Affine2D(a) => (a.elements[0], a.elements[3]),
+            blinc_core::Transform::Mat4(_) => {
+                panic!("expected 2D affine scale, got Mat4")
+            }
+        }
+    }
+
+    #[test]
+    fn div_transform_width_const_sets_scale_and_left_origin() {
+        use crate::div::{ElementBuilder, div};
+        let element = div().transform_width(0.75_f32);
+        let props = element.render_props();
+        assert_eq!(
+            props.transform_origin,
+            Some([0.0, 50.0]),
+            "transform_width must pivot at the left edge"
+        );
+        let t = props.transform.expect("transform set");
+        let (sx, sy) = affine_scale(&t);
+        assert!((sx - 0.75).abs() < 1e-5, "scale_x must be 0.75, got {sx}");
+        assert!((sy - 1.0).abs() < 1e-5, "scale_y must be 1.0, got {sy}");
+    }
+
+    #[test]
+    fn div_transform_width_bound_fires_partial_update_on_set() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+
+        let frac_state = fresh_state::<f32>(0.0);
+        let element = div().transform_width(&frac_state);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        frac_state.set(0.5);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        let upd = updates.into_iter().next().unwrap();
+        assert_eq!(upd.node_id, node_id);
+        assert_eq!(upd.property, PropertyId::Transform);
+        assert!(upd.render_write.is_some(), "must write to RenderProps");
+        assert!(upd.layout_write.is_none(), "must NOT mutate taffy::Style");
+        assert!(
+            !upd.effects.needs_layout,
+            "transform_width is GPU-only — must not request relayout"
+        );
+
+        // Apply the render write — render_props.transform should now be scale(0.5, 1.0).
+        let mut props = RenderProps::default();
+        (upd.render_write.unwrap())(&mut props);
+        let t = props.transform.expect("transform written");
+        let (sx, sy) = affine_scale(&t);
+        assert!((sx - 0.5).abs() < 1e-5);
+        assert!((sy - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn div_bind_transform_from_maps_arbitrary_signal_to_transform() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+        use blinc_core::Transform;
+
+        // State carries a 0..=100 progress value. Mapper produces a
+        // scale-x transform matching what cn::progress's reactive
+        // path does internally — exercises the same primitive.
+        let value_state = fresh_state::<f32>(25.0);
+        let element = div().bind_transform_from(value_state.clone(), |v: f32| {
+            let f = (v / 100.0).clamp(0.0, 1.0);
+            Transform::scale(f, 1.0)
+        });
+        // Seeded transform reflects the initial value (25/100 = 0.25 scale).
+        let initial_props = element.render_props();
+        let initial_t = initial_props.transform.expect("seeded transform");
+        let (initial_sx, _) = affine_scale(&initial_t);
+        assert!((initial_sx - 0.25).abs() < 1e-5);
+
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        value_state.set(80.0);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        let upd = updates.into_iter().next().unwrap();
+        assert_eq!(upd.node_id, node_id);
+        assert_eq!(upd.property, PropertyId::Transform);
+
+        let mut props = RenderProps::default();
+        (upd.render_write.unwrap())(&mut props);
+        let t = props.transform.expect("mapper applied");
+        // 80 / 100 = 0.8
+        let (sx, _) = affine_scale(&t);
+        assert!((sx - 0.8).abs() < 1e-5, "got {sx}");
+    }
+
+    // ============================================================
+    // Single-input transform sugars made reactive (P8.1 follow-up).
+    // `.scale` / `.rotate` / `.rotate_deg` each take impl IntoReactive<f32>;
+    // eager values stay zero-cost via the blanket `IntoReactive for T`,
+    // bound values subscribe + patch props.transform per signal-set.
+    // ============================================================
+
+    #[test]
+    fn div_scale_const_path_unchanged() {
+        use crate::div::{ElementBuilder, div};
+        let element = div().scale(0.5_f32);
+        let t = element.render_props().transform.expect("transform set");
+        let (sx, sy) = affine_scale(&t);
+        assert!((sx - 0.5).abs() < 1e-5 && (sy - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn div_scale_bound_path_fires_partial_update_on_set() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+
+        let s = fresh_state::<f32>(1.0);
+        let element = div().scale(&s);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        s.set(2.0);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        let upd = updates.into_iter().next().unwrap();
+        assert_eq!(upd.node_id, node_id);
+        assert_eq!(upd.property, PropertyId::Transform);
+        assert!(upd.layout_write.is_none(), "GPU-only path, no taffy write");
+
+        let mut props = RenderProps::default();
+        (upd.render_write.unwrap())(&mut props);
+        let (sx, sy) = affine_scale(&props.transform.unwrap());
+        // Uniform scale on both axes from a single f32 — matches the
+        // legacy eager .scale(f) shape.
+        assert!((sx - 2.0).abs() < 1e-5 && (sy - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn div_rotate_const_path_unchanged() {
+        use crate::div::{ElementBuilder, div};
+        // PI/4 (45°) — affine elements [cos, sin, -sin, cos, 0, 0].
+        let element = div().rotate(std::f32::consts::FRAC_PI_4);
+        let t = element.render_props().transform.expect("transform set");
+        if let blinc_core::Transform::Affine2D(a) = t {
+            let expected = std::f32::consts::FRAC_1_SQRT_2;
+            assert!((a.elements[0] - expected).abs() < 1e-5);
+            assert!((a.elements[1] - expected).abs() < 1e-5);
+        } else {
+            panic!("expected affine 2d");
+        }
+    }
+
+    #[test]
+    fn div_rotate_bound_path_fires_partial_update_on_set() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+
+        let angle_state = fresh_state::<f32>(0.0);
+        let element = div().rotate(&angle_state);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        // PI/2 (90°): cos=0, sin=1.
+        angle_state.set(std::f32::consts::FRAC_PI_2);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1);
+        let upd = updates.into_iter().next().unwrap();
+        assert_eq!(upd.node_id, node_id);
+        assert_eq!(upd.property, PropertyId::Transform);
+
+        let mut props = RenderProps::default();
+        (upd.render_write.unwrap())(&mut props);
+        if let blinc_core::Transform::Affine2D(a) = props.transform.unwrap() {
+            assert!(a.elements[0].abs() < 1e-5, "cos(90°) ~ 0");
+            assert!((a.elements[1] - 1.0).abs() < 1e-5, "sin(90°) ~ 1");
+        } else {
+            panic!("expected affine 2d");
+        }
+    }
+
+    #[test]
+    fn div_rotate_deg_bound_path_converts_degrees_to_radians() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+
+        let deg_state = fresh_state::<f32>(0.0);
+        let element = div().rotate_deg(&deg_state);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        deg_state.set(90.0);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        let upd = updates.into_iter().next().unwrap();
+        assert_eq!(upd.node_id, node_id);
+
+        let mut props = RenderProps::default();
+        (upd.render_write.unwrap())(&mut props);
+        if let blinc_core::Transform::Affine2D(a) = props.transform.unwrap() {
+            // 90° should produce the same affine as π/2 rad.
+            assert!(a.elements[0].abs() < 1e-5, "cos(90°) ~ 0");
+            assert!((a.elements[1] - 1.0).abs() < 1e-5, "sin(90°) ~ 1");
+        } else {
+            panic!("expected affine 2d");
+        }
+    }
+
+    // =====================================================================
+    // Derived ↔ IntoReactive bridge (Phase 8 follow-up). The substrate:
+    //   blinc_core::reactive::ReactiveGraph::set fires
+    //   `notify_property_bindings_for_derived` for every derived that
+    //   flipped dirty during the dirty-propagation walk; the binding
+    //   registry's parallel `derived_bindings` map dispatches that into
+    //   subscriber fires.
+    // The end-to-end test: build a Div with a Computed-bound transform,
+    // set a source signal, observe the partial update.
+    // =====================================================================
+
+    /// Shared-graph fresh State<T> — produces a State backed by a
+    /// caller-supplied SharedReactiveGraph so multiple states + a
+    /// derived can all coexist in the same graph.
+    fn state_in_graph<T: Clone + Send + 'static>(
+        graph: &Arc<Mutex<ReactiveGraph>>,
+        initial: T,
+    ) -> State<T> {
+        let signal = graph.lock().unwrap().create_signal(initial);
+        let dirty: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        State::new(signal, Arc::clone(graph), dirty)
+    }
+
+    #[test]
+    fn computed_into_reactive_produces_computed_variant() {
+        let _guard = lock_and_reset();
+        with_registry(|_| {});
+        let graph: Arc<Mutex<ReactiveGraph>> = Arc::new(Mutex::new(ReactiveGraph::new()));
+        let x_signal = graph.lock().unwrap().create_signal(0.0f32);
+        let derived = graph
+            .lock()
+            .unwrap()
+            .create_derived(move |g| g.get(x_signal).unwrap_or(0.0));
+        let computed = blinc_core::Computed::new(derived, Arc::clone(&graph));
+
+        // The IntoReactive impl should resolve to Reactive::Computed.
+        let r: Reactive<f32> = (&computed).into_reactive();
+        assert!(matches!(r, Reactive::Computed(_)));
+    }
+
+    #[test]
+    fn computed_bound_transform_fires_on_dep_signal_set() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+        use blinc_core::Transform;
+
+        with_registry(|_| {});
+        let graph: Arc<Mutex<ReactiveGraph>> = Arc::new(Mutex::new(ReactiveGraph::new()));
+
+        let x_state = state_in_graph::<f32>(&graph, 10.0);
+        let y_state = state_in_graph::<f32>(&graph, 20.0);
+        let x_signal = x_state.signal();
+        let y_signal = y_state.signal();
+
+        // Build a derived that depends on BOTH x and y. The first
+        // `get_derived` call (inside .transform()'s initial-value
+        // seed) records both signals as dependencies via the
+        // auto-tracking system; future sets on either fire the
+        // derived's dirty bit and the parallel binding notifier.
+        let derived = graph
+            .lock()
+            .unwrap()
+            .create_derived(move |g: &ReactiveGraph| {
+                let x = g.get(x_signal).unwrap_or(0.0);
+                let y = g.get(y_signal).unwrap_or(0.0);
+                Transform::translate(x, y)
+            });
+        let computed = blinc_core::Computed::new(derived, Arc::clone(&graph));
+
+        let element = div().transform(&computed);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+
+        // Force initial dep-tracking by reading the computed's value.
+        // Without this, the auto-tracking deps list is empty and the
+        // first `x.set` won't propagate dirty to the derived.
+        let _ = computed.try_get();
+
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        // Set x → derived flips dirty → notifier fires → binding
+        // queues a partial update with the recomputed transform.
+        x_state.set(100.0);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(
+            updates.len(),
+            1,
+            "x.set must fire one partial update via the derived binding"
+        );
+        let upd = updates.into_iter().next().unwrap();
+        assert_eq!(upd.node_id, node_id);
+        assert_eq!(upd.property, PropertyId::Transform);
+        assert!(upd.render_write.is_some());
+        assert!(upd.layout_write.is_none());
+
+        let mut props = RenderProps::default();
+        (upd.render_write.unwrap())(&mut props);
+        // Computed should have recomputed: x=100, y=20 → translate(100, 20)
+        if let blinc_core::Transform::Affine2D(a) = props.transform.unwrap() {
+            assert!(
+                (a.elements[4] - 100.0).abs() < 1e-5,
+                "tx must be 100, got {}",
+                a.elements[4]
+            );
+            assert!(
+                (a.elements[5] - 20.0).abs() < 1e-5,
+                "ty must be 20, got {}",
+                a.elements[5]
+            );
+        } else {
+            panic!("expected 2d affine");
+        }
+
+        // Set y → derived flips dirty AGAIN → another partial update.
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        y_state.set(200.0);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert_eq!(updates.len(), 1, "y.set must also fire one partial update");
+        let upd = updates.into_iter().next().unwrap();
+        let mut props = RenderProps::default();
+        (upd.render_write.unwrap())(&mut props);
+        if let blinc_core::Transform::Affine2D(a) = props.transform.unwrap() {
+            assert!((a.elements[4] - 100.0).abs() < 1e-5);
+            assert!((a.elements[5] - 200.0).abs() < 1e-5);
+        } else {
+            panic!("expected 2d affine");
+        }
+    }
+
+    #[test]
+    fn computed_unregister_node_drops_derived_subscriber() {
+        let _guard = lock_and_reset();
+        use crate::div::{ElementBuilder, div};
+        use blinc_core::Transform;
+
+        with_registry(|_| {});
+        let graph: Arc<Mutex<ReactiveGraph>> = Arc::new(Mutex::new(ReactiveGraph::new()));
+        let x_state = state_in_graph::<f32>(&graph, 0.0);
+        let x_signal = x_state.signal();
+        let derived = graph
+            .lock()
+            .unwrap()
+            .create_derived(move |g: &ReactiveGraph| {
+                Transform::translate(g.get(x_signal).unwrap_or(0.0), 0.0)
+            });
+        let computed = blinc_core::Computed::new(derived, Arc::clone(&graph));
+        let derived_id = computed.derived_id();
+
+        let element = div().transform(&computed);
+        let mut tree = crate::tree::LayoutTree::new();
+        let node_id = element.build(&mut tree);
+        let _ = computed.try_get(); // force dep tracking
+
+        // One subscriber on the derived after build.
+        with_registry(|reg| {
+            assert_eq!(reg.derived_subscriber_count(derived_id), 1);
+        });
+
+        // Drop subscribers for the node.
+        unregister_node(node_id);
+        with_registry(|reg| {
+            assert_eq!(
+                reg.derived_subscriber_count(derived_id),
+                0,
+                "unregister_node must drop derived subscribers too"
+            );
+        });
+
+        // Set x — derived dirty fires the notifier, but the registry
+        // has no subscribers for this derived → no partial update
+        // queued.
+        let _ = crate::stateful::take_pending_partial_prop_updates();
+        x_state.set(123.0);
+        let updates = crate::stateful::take_pending_partial_prop_updates();
+        assert!(
+            updates.is_empty(),
+            "no subscribers → no partial updates after node unregister"
+        );
+    }
+
+    /// f64 sources reach f32-backed properties without the caller
+    /// converting, and without the documented call shapes needing a
+    /// turbofish.
+    mod numeric_width {
+        use super::*;
+
+        /// Built on the process-global graph, as `use_state` and
+        /// DSL-declared signals are: the f64 narrowing mints a derived
+        /// node there, so a local throwaway graph would never resolve.
+        fn state_f64(v: f64) -> State<f64> {
+            State::new(
+                blinc_core::reactive::signal::<f64>(v),
+                blinc_core::reactive::global_graph(),
+                blinc_core::reactive::global_dirty_flag(),
+            )
+        }
+
+        fn state_f32(v: f32) -> State<f32> {
+            State::new(
+                blinc_core::reactive::signal::<f32>(v),
+                blinc_core::reactive::global_graph(),
+                blinc_core::reactive::global_dirty_flag(),
+            )
+        }
+
+        #[test]
+        fn const_f64_narrows() {
+            assert!(matches!(
+                IntoReactive::<f32>::into_reactive(0.5_f64),
+                Reactive::Const(v) if v == 0.5_f32
+            ));
+        }
+
+        /// The regression that mattered: a bound f64 must reach the
+        /// builder as `Bound`, not `Computed`. A `Bound` source keys its
+        /// binding off a `SignalId` and fires on every set; a `Computed`
+        /// source registers a derived binding, which does not refresh
+        /// these properties -- so the prop compiles, renders once, and
+        /// then silently freezes.
+        #[test]
+        fn bound_f64_uses_the_signal_path_not_a_derived() {
+            let s = state_f64(0.25);
+            let r: Reactive<f32> = (&s).into_reactive();
+            let Reactive::Bound(mapped) = r else {
+                panic!("a bound f64 must stay on the signal path");
+            };
+            assert_eq!(
+                mapped.signal_id(),
+                s.signal_id(),
+                "must subscribe to the SOURCE signal, or sets never reach it"
+            );
+        }
+
+        /// Reads narrow live rather than snapshotting at build.
+        #[test]
+        fn mapped_f64_reads_follow_later_sets() {
+            let s = state_f64(0.25);
+            let Reactive::Bound(mapped) = (&s).into_reactive() else {
+                panic!("expected Bound");
+            };
+            assert_eq!(mapped.try_get(), Some(0.25_f32));
+            s.set(0.75);
+            assert_eq!(
+                mapped.try_get(),
+                Some(0.75_f32),
+                "the adapter must re-read the source, not cache"
+            );
+        }
+
+        #[test]
+        fn bound_f64_stays_reactive() {
+            let s = state_f64(0.25);
+            let r: Reactive<f32> = (&s).into_reactive();
+            assert!(
+                !matches!(r, Reactive::Const(_)),
+                "a bound f64 must not collapse to a build-time constant"
+            );
+        }
+
+        /// A `computed { } : f64` fed to an f32 property must bind to
+        /// the SAME derived, not a wrapper. `get_derived` does not track
+        /// derived-to-derived dependencies, so a wrapper is never marked
+        /// dirty and the prop freezes at its build-time value.
+        #[test]
+        fn computed_f64_binds_to_the_upstream_derived() {
+            let s = state_f64(10.0);
+            // Read through the graph handle, not `State::try_get`:
+            // inside a compute the thread already holds the graph
+            // mutex, and `State::try_get` has no re-entrant fast path
+            // (unlike `Signal::try_get`), so it deadlocks.
+            let sig = blinc_core::reactive::Signal::<f64>::from_id(s.signal_id());
+            let upstream = blinc_core::reactive::computed(move |g| g.get(sig).unwrap_or(0.0) * 2.0);
+            let r: Reactive<f32> = (&upstream).into_reactive();
+            let Reactive::Computed(mapped) = r else {
+                panic!("expected a Computed");
+            };
+            assert_eq!(
+                mapped.derived_id(),
+                upstream.derived_id(),
+                "must bind to the upstream derived, or updates never arrive"
+            );
+            assert_eq!(mapped.try_get(), Some(20.0_f32));
+            s.set(30.0);
+            assert_eq!(
+                mapped.try_get(),
+                Some(60.0_f32),
+                "the adapter must re-read the upstream, not cache"
+            );
+        }
+
+        #[test]
+        fn f32_source_is_unaffected() {
+            // The f32 path must stay a plain Bound -- no derived node,
+            // and no change to the documented `.opacity(&state)` shape.
+            let s = state_f32(1.0);
+            let r: Reactive<f32> = (&s).into_reactive();
+            assert!(matches!(r, Reactive::Bound(_)));
+        }
+
+        #[test]
+        fn documented_call_shapes_need_no_turbofish() {
+            // Regression guard: making the setters generic over the
+            // numeric type broke these, because `&State<f32>` satisfies
+            // both `IntoReactive<f32>` and the blanket
+            // `IntoReactive<&State<f32>>`. Concrete f32 setters keep
+            // them inferable. Compiling IS the assertion.
+            let f32_state = state_f32(0.5);
+            let f64_state = state_f64(0.5);
+            let _ = crate::prelude::div()
+                .opacity(&f32_state)
+                .rounded(8.0)
+                .w(120.0);
+            let _ = crate::prelude::div().opacity(&f64_state).w(120.0_f64);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Text content bindings
+    // ---------------------------------------------------------------------
+
+    #[cfg(feature = "text_measurer")]
+    mod bound_text {
+        use super::*;
+        use crate::div::div;
+        use crate::renderer::{ElementType, RenderTree};
+        use crate::text::Text;
+
+        /// A tree with `text` as the only child of a `width`-wide box, and
+        /// that child's node.
+        fn build(text: Text, width: f32) -> (RenderTree, LayoutNodeId) {
+            crate::text_measurer::init_text_measurer();
+            let tree = RenderTree::from_element(&div().w(width).child(text));
+            let root = tree.root().expect("root");
+            let node = tree.layout_tree.children(root)[0];
+            (tree, node)
+        }
+
+        /// Apply what the signals queued, as a runner does, and lay out.
+        fn drain(tree: &mut RenderTree) -> SideEffects {
+            let updates = crate::stateful::take_pending_partial_prop_updates();
+            let effects = tree.apply_partial_property_updates(updates);
+            tree.compute_layout(400.0, 300.0);
+            effects
+        }
+
+        fn shown(tree: &RenderTree, node: LayoutNodeId) -> String {
+            match &tree
+                .get_render_node(node)
+                .expect("render node")
+                .element_type
+            {
+                ElementType::Text(t) => t.content.clone(),
+                _ => panic!("not a text node"),
+            }
+        }
+
+        fn width_of(tree: &RenderTree, node: LayoutNodeId) -> f32 {
+            tree.get_absolute_bounds(node).expect("laid out").width
+        }
+
+        fn height_of(tree: &RenderTree, node: LayoutNodeId) -> f32 {
+            tree.get_absolute_bounds(node).expect("laid out").height
+        }
+
+        #[test]
+        fn bound_text_follows_its_signal_in_place() {
+            let _guard = lock_and_reset();
+            let state = fresh_state::<String>("short".to_string());
+            let (mut tree, node) =
+                build(Text::bound(Reactive::Bound(state.clone())).no_wrap(), 400.0);
+            tree.compute_layout(400.0, 300.0);
+            let before = width_of(&tree, node);
+            assert_eq!(shown(&tree, node), "short");
+
+            state.set("a much longer line of text".to_string());
+            let effects = drain(&mut tree);
+
+            // The same node, now showing the new text and wide enough for it.
+            let root = tree.root().unwrap();
+            assert_eq!(
+                tree.layout_tree.children(root)[0],
+                node,
+                "the node was replaced"
+            );
+            assert_eq!(shown(&tree, node), "a much longer line of text");
+            assert!(
+                width_of(&tree, node) > before + 20.0,
+                "the box did not grow with its content: {before} -> {}",
+                width_of(&tree, node)
+            );
+            assert!(effects.needs_layout && effects.needs_text_remeasure);
+            assert_eq!(
+                tree.layout_tree.text_context(node).unwrap().content,
+                "a much longer line of text"
+            );
+        }
+
+        #[test]
+        fn wrapping_bound_text_grows_taller_with_its_content() {
+            let _guard = lock_and_reset();
+            let state = fresh_state::<String>("one line".to_string());
+            let (mut tree, node) = build(Text::bound(Reactive::Bound(state.clone())), 90.0);
+            tree.compute_layout(400.0, 300.0);
+            let before = height_of(&tree, node);
+
+            state.set("this text is long enough to need several lines in a narrow box".to_string());
+            drain(&mut tree);
+
+            assert!(
+                height_of(&tree, node) > before * 1.5,
+                "the box did not grow taller: {before} -> {}",
+                height_of(&tree, node)
+            );
+        }
+
+        #[test]
+        fn a_computed_source_updates_the_text_too() {
+            let _guard = lock_and_reset();
+            with_registry(|_| {});
+            let graph: Arc<Mutex<ReactiveGraph>> = Arc::new(Mutex::new(ReactiveGraph::new()));
+            let source = state_in_graph::<String>(&graph, "x".to_string());
+            let signal = source.signal();
+            let derived = graph
+                .lock()
+                .unwrap()
+                .create_derived(move |g: &ReactiveGraph| {
+                    format!("<{}>", g.get(signal).unwrap_or_default())
+                });
+            let computed = blinc_core::Computed::new(derived, Arc::clone(&graph));
+
+            let (mut tree, node) = build(
+                Text::bound(Reactive::Computed(computed.clone())).no_wrap(),
+                400.0,
+            );
+            // The first read records the dependency, as for any computed binding.
+            let _ = computed.try_get();
+            assert_eq!(shown(&tree, node), "<x>");
+            let _ = crate::stateful::take_pending_partial_prop_updates();
+
+            source.set("wide".to_string());
+            drain(&mut tree);
+
+            assert_eq!(shown(&tree, node), "<wide>");
+        }
+
+        #[test]
+        fn updated_text_is_decoded_like_the_text_it_was_built_with() {
+            let _guard = lock_and_reset();
+            let state = fresh_state::<String>("a &amp; b".to_string());
+            let (mut tree, node) =
+                build(Text::bound(Reactive::Bound(state.clone())).no_wrap(), 400.0);
+            assert_eq!(shown(&tree, node), "a & b", "the built text is decoded");
+
+            state.set("c &lt; d".to_string());
+            drain(&mut tree);
+
+            assert_eq!(shown(&tree, node), "c < d");
+        }
+
+        #[test]
+        fn the_measured_width_the_paint_path_compares_follows_the_content() {
+            let _guard = lock_and_reset();
+            let state = fresh_state::<String>("hi".to_string());
+            let (mut tree, node) = build(Text::bound(Reactive::Bound(state.clone())), 400.0);
+            let measured =
+                |tree: &RenderTree| match &tree.get_render_node(node).unwrap().element_type {
+                    ElementType::Text(t) => t.measured_width,
+                    _ => panic!("not a text node"),
+                };
+            let before = measured(&tree);
+
+            state.set("considerably longer than before".to_string());
+            drain(&mut tree);
+
+            assert!(
+                measured(&tree) > before * 4.0,
+                "measured width stayed at {before}, now {}",
+                measured(&tree)
+            );
+        }
+
+        #[test]
+        fn an_unchanged_value_is_not_applied() {
+            let _guard = lock_and_reset();
+            let state = fresh_state::<String>("same".to_string());
+            let (mut tree, node) = build(Text::bound(Reactive::Bound(state)).no_wrap(), 400.0);
+            assert!(!tree.set_text_content(node, "same".to_string()));
+            assert!(tree.set_text_content(node, "different".to_string()));
+        }
+
+        #[test]
+        fn a_constant_source_stays_a_plain_text() {
+            let _guard = lock_and_reset();
+            let (tree, node) = build(
+                Text::bound(Reactive::Const("fixed".to_string())).no_wrap(),
+                400.0,
+            );
+
+            assert_eq!(
+                with_registry(|r| r.signal_count()),
+                0,
+                "a constant registered a binding"
+            );
+            assert!(
+                tree.layout_tree.text_context(node).is_none(),
+                "a constant non-wrapping text should keep its fixed size, not get a context"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Display bindings
+    // ---------------------------------------------------------------------
+
+    mod visible {
+        use super::*;
+        use crate::div::{Div, div};
+        use crate::renderer::RenderTree;
+        use taffy::Display;
+
+        /// A tree with `element` as the only child of a fixed box, and that
+        /// child's node.
+        fn build(element: Div) -> (RenderTree, LayoutNodeId) {
+            let mut tree = RenderTree::from_element(&div().w(200.0).h(100.0).child(element));
+            tree.compute_layout(200.0, 100.0);
+            let root = tree.root().expect("root");
+            let node = tree.layout_tree.children(root)[0];
+            (tree, node)
+        }
+
+        /// Apply what the signals queued, as a runner does, and lay out.
+        fn drain(tree: &mut RenderTree) {
+            let updates = crate::stateful::take_pending_partial_prop_updates();
+            tree.apply_partial_property_updates(updates);
+            tree.compute_layout(200.0, 100.0);
+        }
+
+        fn display(tree: &RenderTree, node: LayoutNodeId) -> Display {
+            tree.layout_tree.get_style(node).expect("style").display
+        }
+
+        fn width(tree: &RenderTree, node: LayoutNodeId) -> f32 {
+            tree.get_absolute_bounds(node).expect("laid out").width
+        }
+
+        fn content() -> Div {
+            div().child(div().w(50.0).h(20.0))
+        }
+
+        #[test]
+        fn a_constant_decides_the_display_at_build() {
+            let _guard = lock_and_reset();
+            let (_, hidden) = build(content().visible(false));
+            let (tree, shown) = build(content().visible(true));
+            assert_eq!(display(&tree, shown), Display::Flex);
+            let (tree, hidden_node) = build(content().visible(false));
+            assert_eq!(display(&tree, hidden_node), Display::None);
+            let _ = hidden;
+            assert_eq!(
+                with_registry(|r| r.signal_count()),
+                0,
+                "a constant registered a binding"
+            );
+        }
+
+        #[test]
+        fn a_signal_flips_the_display_in_place() {
+            let _guard = lock_and_reset();
+            let visible = fresh_state::<bool>(true);
+            let (mut tree, node) = build(content().w_fit().visible(&visible));
+            assert!(width(&tree, node) > 0.0, "sanity: shown at build");
+
+            visible.set(false);
+            drain(&mut tree);
+            assert_eq!(display(&tree, node), Display::None);
+            assert_eq!(
+                width(&tree, node),
+                0.0,
+                "a hidden element still takes space"
+            );
+
+            visible.set(true);
+            drain(&mut tree);
+            assert_eq!(display(&tree, node), Display::Flex);
+            assert!(width(&tree, node) > 0.0, "it did not come back");
+
+            let root = tree.root().unwrap();
+            assert_eq!(
+                tree.layout_tree.children(root)[0],
+                node,
+                "the node was replaced"
+            );
+        }
+
+        #[test]
+        fn a_false_signal_builds_hidden() {
+            let _guard = lock_and_reset();
+            let visible = fresh_state::<bool>(false);
+            let (mut tree, node) = build(content().visible(&visible));
+            assert_eq!(display(&tree, node), Display::None);
+
+            visible.set(true);
+            drain(&mut tree);
+            assert_eq!(display(&tree, node), Display::Flex);
+        }
+
+        #[test]
+        fn it_comes_back_as_the_display_it_was_built_with_whatever_the_call_order() {
+            let _guard = lock_and_reset();
+            for grid_first in [true, false] {
+                let visible = fresh_state::<bool>(true);
+                let element = if grid_first {
+                    content().grid().visible(&visible)
+                } else {
+                    content().visible(&visible).grid()
+                };
+                let (mut tree, node) = build(element);
+                assert_eq!(display(&tree, node), Display::Grid);
+
+                visible.set(false);
+                drain(&mut tree);
+                visible.set(true);
+                drain(&mut tree);
+                assert_eq!(
+                    display(&tree, node),
+                    Display::Grid,
+                    "grid_first = {grid_first}: it came back as the wrong display"
+                );
+            }
+        }
+
+        #[test]
+        fn a_later_layout_method_does_not_undo_a_hide() {
+            let _guard = lock_and_reset();
+            let (tree, node) = build(content().visible(false).flex_row());
+            assert_eq!(display(&tree, node), Display::None);
+        }
+
+        #[test]
+        fn a_computed_source_flips_it_too() {
+            let _guard = lock_and_reset();
+            with_registry(|_| {});
+            let graph: Arc<Mutex<ReactiveGraph>> = Arc::new(Mutex::new(ReactiveGraph::new()));
+            let count = state_in_graph::<i32>(&graph, 0);
+            let signal = count.signal();
+            let derived = graph
+                .lock()
+                .unwrap()
+                .create_derived(move |g: &ReactiveGraph| g.get(signal).unwrap_or(0) > 0);
+            let computed = blinc_core::Computed::new(derived, Arc::clone(&graph));
+
+            let (mut tree, node) = build(content().visible(&computed));
+            // The first read records the dependency, as for any computed binding.
+            let _ = computed.try_get();
+            assert_eq!(display(&tree, node), Display::None);
+            let _ = crate::stateful::take_pending_partial_prop_updates();
+
+            count.set(3);
+            drain(&mut tree);
+            assert_eq!(display(&tree, node), Display::Flex);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Text style bindings
+    // ---------------------------------------------------------------------
+
+    #[cfg(feature = "text_measurer")]
+    mod bound_text_style {
+        use super::*;
+        use crate::div::{FontWeight, div};
+        use crate::renderer::{ElementType, RenderTree};
+        use crate::text::Text;
+        use blinc_core::Color;
+
+        fn build(text: impl FnOnce() -> Text) -> (RenderTree, LayoutNodeId) {
+            // A text is measured when it is built, so the measurer comes first.
+            crate::text_measurer::init_text_measurer();
+            let mut tree = RenderTree::from_element(&div().w(600.0).child(text()));
+            tree.compute_layout(600.0, 300.0);
+            let root = tree.root().expect("root");
+            let node = tree.layout_tree.children(root)[0];
+            (tree, node)
+        }
+
+        /// Apply what the signals queued and lay out, as a runner does.
+        fn drain(tree: &mut RenderTree) -> SideEffects {
+            let updates = crate::stateful::take_pending_partial_prop_updates();
+            let effects = tree.apply_partial_property_updates(updates);
+            tree.compute_layout(600.0, 300.0);
+            effects
+        }
+
+        fn width(tree: &RenderTree, node: LayoutNodeId) -> f32 {
+            tree.get_absolute_bounds(node).expect("laid out").width
+        }
+
+        fn data(tree: &RenderTree, node: LayoutNodeId) -> crate::renderer::TextData {
+            match &tree.get_render_node(node).unwrap().element_type {
+                ElementType::Text(t) => t.clone(),
+                _ => panic!("not a text node"),
+            }
+        }
+
+        #[test]
+        fn a_bound_size_resizes_the_box_in_place() {
+            let _guard = lock_and_reset();
+            let size = fresh_state::<f32>(14.0);
+            let (mut tree, node) = build(|| Text::new("Hello").size(&size).no_wrap());
+            let before = width(&tree, node);
+
+            size.set(40.0);
+            let effects = drain(&mut tree);
+
+            let root = tree.root().unwrap();
+            assert_eq!(
+                tree.layout_tree.children(root)[0],
+                node,
+                "the node was replaced"
+            );
+            assert!(effects.needs_layout && effects.needs_text_remeasure);
+            assert!(
+                width(&tree, node) > before * 2.4,
+                "the box did not follow the size: {before} -> {}",
+                width(&tree, node)
+            );
+            assert_eq!(data(&tree, node).font_size, 40.0);
+        }
+
+        #[test]
+        fn a_computed_size_works_too() {
+            let _guard = lock_and_reset();
+            with_registry(|_| {});
+            let graph: Arc<Mutex<ReactiveGraph>> = Arc::new(Mutex::new(ReactiveGraph::new()));
+            let steps = state_in_graph::<i32>(&graph, 1);
+            let signal = steps.signal();
+            let derived = graph
+                .lock()
+                .unwrap()
+                .create_derived(move |g: &ReactiveGraph| 12.0 * g.get(signal).unwrap_or(1) as f32);
+            let computed = blinc_core::Computed::new(derived, Arc::clone(&graph));
+
+            let (mut tree, node) = build(|| Text::new("Hello").size(&computed).no_wrap());
+            // The first read records the dependency, as for any computed binding.
+            let _ = computed.try_get();
+            let before = width(&tree, node);
+            let _ = crate::stateful::take_pending_partial_prop_updates();
+
+            steps.set(3);
+            drain(&mut tree);
+
+            assert!(
+                width(&tree, node) > before * 2.4,
+                "{before} -> {}",
+                width(&tree, node)
+            );
+        }
+
+        #[test]
+        fn a_bound_weight_is_measured_at_that_weight() {
+            let _guard = lock_and_reset();
+            let weight = fresh_state::<FontWeight>(FontWeight::Normal);
+            let (mut tree, node) = build(|| Text::new("Weighted text").weight(&weight).no_wrap());
+            let before = width(&tree, node);
+
+            weight.set(FontWeight::Black);
+            drain(&mut tree);
+
+            assert!(
+                width(&tree, node) > before,
+                "black measured no wider than regular: {before}"
+            );
+        }
+
+        #[test]
+        fn a_bound_color_repaints_without_asking_for_layout() {
+            let _guard = lock_and_reset();
+            let color = fresh_state::<Color>(Color::RED);
+            let (mut tree, node) = build(|| Text::new("Hello").color(&color).no_wrap());
+            let before = width(&tree, node);
+
+            color.set(Color::BLUE);
+            let effects = drain(&mut tree);
+
+            let drawn = tree.get_render_node(node).unwrap().props.text_color;
+            assert_eq!(
+                drawn,
+                Some([0.0, 0.0, 1.0, 1.0]),
+                "paint was not given the colour"
+            );
+            assert!(!effects.needs_layout, "a colour change asked for layout");
+            assert_eq!(width(&tree, node), before);
+        }
+
+        #[test]
+        fn a_bound_letter_spacing_widens_a_non_wrapping_box() {
+            let _guard = lock_and_reset();
+            let spacing = fresh_state::<f32>(0.0);
+            let (mut tree, node) = build(|| Text::new("abcd").letter_spacing(&spacing).no_wrap());
+            let before = width(&tree, node);
+
+            spacing.set(4.0);
+            drain(&mut tree);
+
+            assert!(
+                width(&tree, node) > before + 12.0,
+                "{before} -> {}",
+                width(&tree, node)
+            );
+        }
+
+        #[test]
+        fn constants_behave_as_they_did() {
+            let _guard = lock_and_reset();
+            let (tree, node) = build(|| {
+                Text::new("Hello")
+                    .size(20.0)
+                    .weight(FontWeight::Bold)
+                    .no_wrap()
+            });
+            assert_eq!(data(&tree, node).font_size, 20.0);
+            assert_eq!(
+                with_registry(|r| r.signal_count()),
+                0,
+                "a constant registered a binding"
+            );
+        }
+    }
+}
