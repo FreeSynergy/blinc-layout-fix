@@ -8,7 +8,7 @@ All notable changes to `blinc_layout` will be documented in this file.
 - CSS `:focus-visible` distinguishes keyboard focus from pointer focus.
 
 ### Fixed
-- FreeSynergy: `RenderTree::restyle_replaced_nodes` restyles the nodes the last `incremental_update` replaced the props of; a node whose own hash is unchanged keeps its props.
+- FreeSynergy: `RenderTree::restyle_replaced_nodes` restyles the nodes the last `incremental_update` replaced the props of; a node whose own hash is unchanged keeps its props and its taffy style (the stylesheet's layout rules survive a visual-only update and a relayout).
 - Overlay focus returns to stable trigger identities on dismissal, and nested scopes constrain Tab to the topmost active popup. Pointer focus persists without a keyboard ring. Menu roles support roving focus, submenu keys and keyboard context-menu activation.
 
 ## [0.6.0] - 2026-11-04
