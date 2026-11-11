@@ -1,3 +1,6 @@
+> **Hinweis:** Diese Fork-Hilfsbranch-Repo läuft aus: Änderungen sind als Pull-Requests nach upstream (project-blinc/Blinc) gegangen bzw. werden in FreeSynergy/Blinc geführt; keine weitere Pflege.
+> Die Änderung (`restyle_replaced_nodes`) ist als Pull-Request nach upstream gegangen (project-blinc/Blinc #71 und #72, beide gemergt).
+
 # blinc_layout
 
 > **Part of the [Blinc UI Framework](https://project-blinc.github.io/Blinc)**
